@@ -8,6 +8,10 @@
 // the same parser/scanners, so joins and every normalized DEX relation follow
 // one implementation instead of diverging in a second handwritten subset.
 use dexsql_core::sql::query as query_engine;
+mod budget;
+mod input;
+mod params;
+mod process;
 mod resources;
 
 use dexsql_core::dex::{decode, Dataset};
@@ -24,7 +28,6 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::codec::{FramedRead, FramedWrite};
@@ -89,7 +92,7 @@ pub const TABLES: &[&str] = &[
     "annotation_elements_resolved",
 ];
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Config {
     pub timeout_ms: u64,
     pub max_datasets: usize,
@@ -138,47 +141,43 @@ struct State {
     opening_bytes: u64,
     datasets: HashMap<String, Entry>,
 }
-/// A semaphore for queued and running heavy operations.  Admission is
-/// non-blocking: callers over the configured bound get a deterministic
-/// `server_busy` response rather than an unbounded queue.
-#[derive(Debug)]
-struct Admission {
-    state: Mutex<usize>,
-    max: usize,
-}
-impl Admission {
-    fn new(max: usize) -> Self {
-        Self {
-            state: Mutex::new(0),
-            max,
-        }
-    }
-    fn try_acquire(&self) -> bool {
-        let mut n = self.state.lock().expect("admission lock");
-        if *n >= self.max || self.max == 0 {
-            return false;
-        }
-        *n += 1;
-        true
-    }
-    fn release(&self) {
-        let mut n = self.state.lock().expect("admission lock");
-        *n = n.saturating_sub(1);
-    }
-}
 /// Serve MCP requests from stdin/stdout through rmcp's Tokio stdio transport.
 ///
 /// rmcp owns framing, lifecycle negotiation, request dispatch, and cancellation
 /// propagation.  The existing synchronous dataset/query implementation is
 /// isolated behind `spawn_blocking` in `RmcpHandler`, so expensive DEX work
 /// cannot stall the transport reader or writer.
-pub fn serve_stdio(config: Config) -> io::Result<()> {
+pub fn serve_stdio(config: Config, threads: Option<usize>) -> io::Result<()> {
+    if config.timeout_ms == 0 {
+        return Err(io::Error::other("--timeout-ms must be positive"));
+    }
+    for (name, value, min, max) in [
+        ("max-datasets", config.max_datasets as u64, 1, 64),
+        ("max-pending", config.max_pending as u64, 1, 1024),
+        ("max-output-bytes", config.max_output_bytes, 4096, 1_048_576),
+        (
+            "max-resource-bytes",
+            config.max_resource_bytes,
+            1,
+            536_870_912,
+        ),
+    ] {
+        if !(min..=max).contains(&value) {
+            return Err(io::Error::other(format!(
+                "--{name} must be in {min}..={max}"
+            )));
+        }
+    }
+    if config.max_input_bytes == 0 || config.max_dex_bytes == 0 || config.max_total_input_bytes == 0
+    {
+        return Err(io::Error::other("input byte budgets must be positive"));
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(io::Error::other)?;
     runtime.block_on(async move {
-        let handler = RmcpHandler::new(config);
+        let handler = RmcpHandler::new(config, threads);
         // The reference uses rmcp's sink/stream adapter around the JSON-line
         // codec.  Keeping the framed reader in a `take_while` stream preserves
         // rmcp's stdio shutdown semantics: malformed input ends the stream,
@@ -205,18 +204,8 @@ pub fn serve_stdio(config: Config) -> io::Result<()> {
     })
 }
 
-fn try_close_argument_dataset(params: &Value, state: &Arc<Mutex<State>>) {
-    let Some(id) = params
-        .get("arguments")
-        .and_then(|args| args.get("dataset_id"))
-        .and_then(Value::as_str)
-        .or_else(|| params.get("dataset_id").and_then(Value::as_str))
-    else {
-        return;
-    };
-    if let Ok(mut guard) = state.try_lock() {
-        guard.datasets.remove(id);
-    }
+pub fn serve_worker() -> io::Result<()> {
+    process::serve_worker()
 }
 
 fn archive_stamp(path: &Path) -> (u64, u128) {
@@ -230,23 +219,6 @@ fn archive_stamp(path: &Path) -> (u64, u128) {
         .map_or(0, |duration| duration.as_nanos());
     (metadata.len(), modified)
 }
-fn json_type_label(value: &Value) -> String {
-    match value {
-        Value::Null => "null".to_owned(),
-        Value::Bool(value) => format!("boolean `{value}`"),
-        Value::Number(value) => {
-            if value.is_i64() || value.is_u64() {
-                format!("integer `{value}`")
-            } else {
-                format!("number `{value}`")
-            }
-        }
-        Value::String(value) => format!("string {value:?}"),
-        Value::Array(_) => "sequence".to_owned(),
-        Value::Object(_) => "map".to_owned(),
-    }
-}
-
 /// rmcp server adapter for the existing dexsql tool implementation.
 ///
 /// The query, decode, and archive code predates the rmcp integration and is
@@ -255,17 +227,13 @@ fn json_type_label(value: &Value) -> String {
 /// potentially expensive work runs on Tokio's blocking pool.
 #[derive(Clone)]
 struct RmcpHandler {
-    state: Arc<Mutex<State>>,
-    admission: Arc<Admission>,
-    config: Config,
+    server: Arc<process::Server>,
 }
 
 impl RmcpHandler {
-    fn new(config: Config) -> Self {
+    fn new(config: Config, threads: Option<usize>) -> Self {
         Self {
-            state: Arc::new(Mutex::new(State::default())),
-            admission: Arc::new(Admission::new(config.max_pending)),
-            config,
+            server: Arc::new(process::Server::new(config, threads)),
         }
     }
 
@@ -306,293 +274,6 @@ impl RmcpHandler {
         ))])
     }
 
-    /// Match rmcp's generated `Parameters<T>` behavior for the synchronous tool
-    /// dispatcher: typed wrappers reject unknown fields and report missing
-    /// required fields as tool-level deserialization errors.
-    fn validate_arguments(name: &str, arguments: &Map<String, Value>) -> Option<CallToolResult> {
-        let (fields, required): (&[&str], &[&str]) = match name {
-            "open_dataset" => (&["inputs", "timeout_ms"], &["inputs"]),
-            "close_dataset" => (&["dataset_id"], &["dataset_id"]),
-            "describe_table" => (&["name"], &["name"]),
-            "query" => (
-                &[
-                    "dataset_id",
-                    "sql",
-                    "named_temp_queries",
-                    "limit",
-                    "offset",
-                    "max_bytes",
-                    "compact",
-                    "timing",
-                    "timeout_ms",
-                ],
-                &["dataset_id", "sql"],
-            ),
-            "decode" => (
-                &[
-                    "dataset_id",
-                    "file_id",
-                    "method",
-                    "method_idx",
-                    "class",
-                    "mode",
-                    "method_offset",
-                    "method_limit",
-                    "offset",
-                    "max_lines",
-                    "max_bytes",
-                    "timeout_ms",
-                    "compact",
-                ],
-                &["dataset_id"],
-            ),
-            "get_manifest" => (
-                &[
-                    "dataset_id",
-                    "input_index",
-                    "mode",
-                    "offset",
-                    "limit",
-                    "max_bytes",
-                    "timeout_ms",
-                    "compact",
-                ],
-                &["dataset_id"],
-            ),
-            "get_manifest_components" => (
-                &[
-                    "dataset_id",
-                    "input_index",
-                    "kind",
-                    "offset",
-                    "limit",
-                    "only_exported",
-                    "max_bytes",
-                    "timeout_ms",
-                    "compact",
-                ],
-                &["dataset_id"],
-            ),
-            "list_resource_files" => (
-                &[
-                    "dataset_id",
-                    "input_index",
-                    "prefix",
-                    "offset",
-                    "limit",
-                    "max_bytes",
-                    "timeout_ms",
-                    "compact",
-                ],
-                &["dataset_id"],
-            ),
-            "read_resource" => (
-                &[
-                    "dataset_id",
-                    "input_index",
-                    "name",
-                    "format",
-                    "offset",
-                    "max_bytes",
-                    "timeout_ms",
-                    "compact",
-                ],
-                &["dataset_id", "name"],
-            ),
-            "query_resources" => (
-                &[
-                    "dataset_id",
-                    "input_index",
-                    "resource_id",
-                    "name",
-                    "resource_type",
-                    "contains",
-                    "configuration",
-                    "offset",
-                    "limit",
-                    "max_bytes",
-                    "timeout_ms",
-                    "compact",
-                ],
-                &["dataset_id"],
-            ),
-            "list_datasets" | "list_tables" => return None,
-            _ => return None,
-        };
-        if let Some(field) = arguments
-            .keys()
-            .find(|field| !fields.contains(&field.as_str()))
-        {
-            let expected = if fields.len() == 1 {
-                format!("expected `{}`", fields[0])
-            } else if name == "open_dataset" {
-                format!("expected `{}` or `{}`", fields[0], fields[1])
-            } else {
-                format!(
-                    "expected one of {}",
-                    fields
-                        .iter()
-                        .map(|field| format!("`{field}`"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            };
-            return Some(Self::parameter_error(format!(
-                "unknown field `{field}`, {expected}"
-            )));
-        }
-        if let Some(field) = required
-            .iter()
-            .find(|field| !arguments.contains_key(**field))
-        {
-            return Some(Self::parameter_error(format!("missing field `{field}`")));
-        }
-        // serde's generated wrappers report primitive type failures before the
-        // tool implementation gets a chance to validate semantic ranges.
-        let string_fields = [
-            "dataset_id",
-            "name",
-            "method",
-            "class",
-            "kind",
-            "prefix",
-            "format",
-            "resource_type",
-            "contains",
-            "configuration",
-            "mode",
-        ];
-        if let Some((_, value)) = arguments.iter().find(|(field, value)| {
-            string_fields.contains(&field.as_str()) && !value.is_string() && !value.is_null()
-        }) {
-            return Some(Self::parameter_error(format!(
-                "invalid type: {}, expected a string",
-                json_type_label(value)
-            )));
-        }
-        if let Some(value) = arguments.get("timeout_ms") {
-            if let Some(number) = value.as_i64() {
-                if number < 0 {
-                    return Some(Self::parameter_error(format!(
-                        "invalid value: integer `{number}`, expected u64"
-                    )));
-                }
-            } else if !value.is_u64() && !value.is_null() {
-                return Some(Self::parameter_error(format!(
-                    "invalid type: {}, expected u64",
-                    json_type_label(value)
-                )));
-            }
-        }
-        if let Some(value) = arguments.get("timing") {
-            if !value.is_boolean() && !value.is_null() {
-                return Some(Self::parameter_error(format!(
-                    "invalid type: {}, expected a boolean",
-                    json_type_label(value)
-                )));
-            }
-        }
-        if let Some(value) = arguments.get("compact") {
-            if !value.is_boolean() {
-                return Some(Self::parameter_error(format!(
-                    "invalid type: {}, expected a boolean",
-                    json_type_label(value)
-                )));
-            }
-        }
-        let usize_fields = [
-            "input_index",
-            "offset",
-            "limit",
-            "max_bytes",
-            "method_offset",
-            "method_limit",
-            "max_lines",
-        ];
-        let u32_fields = ["file_id", "method_idx", "resource_id"];
-        for (field, value) in arguments {
-            let expected = if usize_fields.contains(&field.as_str()) {
-                Some("usize")
-            } else if u32_fields.contains(&field.as_str()) {
-                Some("u32")
-            } else {
-                None
-            };
-            let Some(expected) = expected else { continue };
-            if value.is_null() {
-                continue;
-            }
-            if let Some(number) = value.as_i64() {
-                if number < 0 {
-                    return Some(Self::parameter_error(format!(
-                        "invalid value: integer `{number}`, expected {expected}"
-                    )));
-                }
-            } else if value.as_u64().is_none() {
-                return Some(Self::parameter_error(format!(
-                    "invalid type: {}, expected {expected}",
-                    json_type_label(value)
-                )));
-            }
-        }
-        if let Some(value) = arguments.get("inputs").filter(|value| !value.is_array()) {
-            return Some(Self::parameter_error(format!(
-                "invalid type: {}, expected a sequence",
-                json_type_label(value)
-            )));
-        }
-        if let Some(value) = arguments.get("inputs").and_then(Value::as_array) {
-            if let Some(item) = value.iter().find(|item| !item.is_string()) {
-                return Some(Self::parameter_error(format!(
-                    "invalid type: {}, expected a string",
-                    json_type_label(item)
-                )));
-            }
-        }
-        if let Some(value) = arguments.get("sql").filter(|value| !value.is_array()) {
-            return Some(Self::parameter_error(format!(
-                "invalid type: {}, expected a sequence",
-                json_type_label(value)
-            )));
-        }
-        if let Some(value) = arguments.get("sql").and_then(Value::as_array) {
-            if let Some(item) = value.iter().find(|item| !item.is_string()) {
-                return Some(Self::parameter_error(format!(
-                    "invalid type: {}, expected a string",
-                    json_type_label(item)
-                )));
-            }
-        }
-        let variants: &[(&str, &[&str])] = match name {
-            "read_resource" => &[("format", &["auto", "hex"])],
-            "get_manifest" => &[("mode", &["summary", "xml"])],
-            "decode" => &[("mode", &["summary", "smali", "context"])],
-            _ => &[],
-        };
-        for (field, values) in variants {
-            if let Some(value) = arguments.get(*field).and_then(Value::as_str) {
-                if !values.contains(&value) {
-                    let expected = if values.len() == 2 {
-                        format!("`{}` or `{}`", values[0], values[1])
-                    } else {
-                        format!(
-                            "one of {}",
-                            values
-                                .iter()
-                                .map(|value| format!("`{value}`"))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        )
-                    };
-                    return Some(Self::parameter_error(format!(
-                        "unknown variant `{value}`, expected {expected}"
-                    )));
-                }
-            }
-        }
-        None
-    }
-
     async fn run_tool(
         &self,
         params: CallToolRequestParams,
@@ -605,173 +286,21 @@ impl RmcpHandler {
         {
             return Err(McpError::invalid_params("tool not found", None));
         }
-        let arguments = Value::Object(params.arguments.unwrap_or_default());
-        if let Some(arguments_object) = arguments.as_object() {
-            if let Some(error) = Self::validate_arguments(params.name.as_ref(), arguments_object) {
-                return Ok(error);
-            }
-        }
-        let request = json!({
-            "name": params.name.as_ref(),
-            "arguments": arguments,
-        });
-        let request_for_close = request.clone();
-        let worker_dataset_id = request
-            .get("arguments")
-            .and_then(|arguments| arguments.get("dataset_id"))
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let requested_timeout = request
-            .get("arguments")
-            .and_then(|value| value.get("timeout_ms"))
-            .and_then(Value::as_u64);
-        let timeout_ms = match requested_timeout {
-            Some(value) if value == 0 || value > self.config.timeout_ms => {
-                return Ok(CallToolResult::structured_error(json!({
-                    "error": {
-                        "kind": "invalid_input",
-                        "message": format!(
-                            "timeout_ms must be in 1..={}",
-                            self.config.timeout_ms
-                        ),
-                    }
-                })));
-            }
-            Some(value) => value,
-            None => self.config.timeout_ms,
-        };
-        if !self.admission.try_acquire() {
-            return Ok(CallToolResult::structured_error(json!({
-                "error": {
-                    "kind": "server_busy",
-                    "message": "request queue full",
-                }
-            })));
-        }
-        let progress_token = context.meta.get_progress_token();
-        if params.name.as_ref() == "open_dataset" {
-            if let Some(token) = progress_token.clone() {
-                let _ = context.peer.notify_progress(ProgressNotificationParam::new(
-                    token, started.elapsed().as_secs_f64(),
-                ).with_message("preparing dataset; elapsed 0.0s (elapsed time, not completion percentage)")).await;
-            }
-        }
-        let state = Arc::clone(&self.state);
-        let config = self.config.clone();
-        let admission = Arc::clone(&self.admission);
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled_worker = Arc::clone(&cancelled);
-        let worker_state = Arc::clone(&state);
-        let worker = tokio::task::spawn_blocking(move || {
-            let result = crate::mcp::call_tool(&request, &state, &config);
-            // A blocking operation cannot be force-aborted safely.  If rmcp
-            // cancelled or timed out this request while it was running, close
-            // a dataset that the operation may have created before returning.
-            if cancelled_worker.load(Ordering::Relaxed) {
-                if let Some(dataset_id) = worker_dataset_id.as_deref() {
-                    if let Ok(mut guard) = worker_state.lock() {
-                        guard.datasets.remove(dataset_id);
-                    }
-                }
-                if let Ok(value) = &result {
-                    if let Some(dataset_id) = value
-                        .get("structuredContent")
-                        .and_then(|content| content.get("dataset_id"))
-                        .and_then(Value::as_str)
-                    {
-                        if let Ok(mut guard) = worker_state.lock() {
-                            guard.datasets.remove(dataset_id);
-                        }
-                    }
-                }
-            }
-            admission.release();
-            result
-        });
-        let deadline = Duration::from_millis(timeout_ms);
-        let result = tokio::select! {
-            _ = context.ct.cancelled() => {
-                cancelled.store(true, Ordering::Relaxed);
-                try_close_argument_dataset(&request_for_close, &self.state);
-                return Err(McpError::internal_error("task cancelled for reason", None));
-            }
-            result = tokio::time::timeout(deadline, worker) => result,
-        };
-        let value = match result {
-            Ok(Ok(Ok(value))) => value,
-            Ok(Ok(Err((_, message)))) => tool_error_result("invalid_request", &message),
-            Ok(Err(error)) => {
-                try_close_argument_dataset(&request_for_close, &self.state);
-                return Err(McpError::internal_error(
-                    format!("worker failed: {error}"),
-                    None,
-                ));
-            }
-            Err(_) => {
-                cancelled.store(true, Ordering::Relaxed);
-                try_close_argument_dataset(&request_for_close, &self.state);
-                let dataset_id = request_for_close
-                    .get("arguments")
-                    .and_then(|value| value.get("dataset_id"))
-                    .and_then(Value::as_str);
-                let (dataset_id, dataset_closed, message) = match dataset_id {
-                    Some(dataset_id) => (
-                        Value::String(dataset_id.to_owned()),
-                        true,
-                        "running computation was terminated and this dataset was closed; call open_dataset to use it again",
-                    ),
-                    None => (
-                        Value::Null,
-                        false,
-                        "request ended before a dataset operation completed; existing datasets remain open",
-                    ),
-                };
-                return Ok(CallToolResult::structured_error(json!({
-                    "dataset_id": dataset_id,
-                    "error": {
-                        "dataset_closed": dataset_closed,
-                        "kind": "timeout",
-                        "message": message,
-                    },
-                })));
-            }
-        };
-        let compact = request_for_close
-            .get("name")
-            .and_then(Value::as_str)
-            .is_some_and(|name| {
-                matches!(
-                    name,
-                    "decode"
-                        | "get_manifest"
-                        | "get_manifest_components"
-                        | "list_resource_files"
-                        | "query"
-                        | "query_resources"
-                        | "read_resource"
-                )
-            })
-            && request_for_close
-                .get("arguments")
-                .and_then(|arguments| arguments.get("compact"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
+        let arguments =
+            match params::normalize(params.name.as_ref(), &params.arguments.unwrap_or_default()) {
+                Ok(arguments) => arguments,
+                Err(error) => return Ok(Self::parameter_error(error)),
+            };
+        let compact = arguments["compact"].as_bool() == Some(true);
+        let value = self
+            .server
+            .run(params.name.as_ref(), arguments, &context, started)
+            .await?;
         let value = if compact {
             compact_tool_result(value)
         } else {
             value
         };
-        if params.name.as_ref() != "open_dataset" {
-            if let Some(token) = progress_token {
-                let _ = context
-                    .peer
-                    .notify_progress(
-                        ProgressNotificationParam::new(token, started.elapsed().as_secs_f64())
-                            .with_message("completed"),
-                    )
-                    .await;
-            }
-        }
         serde_json::from_value(value).map_err(|error| {
             McpError::internal_error(format!("failed to serialize tool result: {error}"), None)
         })
@@ -1320,7 +849,25 @@ fn call_tool(p: &Value, state: &Arc<Mutex<State>>, cfg: &Config) -> Result<Value
         _ => Err((-32602, format!("unknown tool: {name}"))),
     };
     match value {
-        Ok(value) => {
+        Ok(mut value) => {
+            let max = a
+                .get("max_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(cfg.max_output_bytes) as usize;
+            let compact = a["compact"].as_bool().unwrap_or(false);
+            let field = match name {
+                "get_manifest" => Some("permissions"),
+                "get_manifest_components" => Some("components"),
+                "list_resource_files" => Some("files"),
+                "query_resources" => Some("values"),
+                _ => None,
+            };
+            if let Some(field) = field {
+                value = budget::page(value, field, max, compact);
+            }
+            if name == "query" && value.get("error").is_none() {
+                value = budget::query(value, max, compact);
+            }
             let text = serde_json::to_string(&value).map_err(|e| (-32603, e.to_string()))?;
             if text.len() as u64 > cfg.max_output_bytes {
                 return Ok(tool_error_result(
@@ -1339,6 +886,14 @@ fn call_tool(p: &Value, state: &Arc<Mutex<State>>, cfg: &Config) -> Result<Value
             if name == "describe_table" {
                 return Ok(tool_error_result("unknown_table", &message));
             }
+            if message
+                == "dataset has no DEX files; archive-only datasets support archive tools only"
+            {
+                return Ok(tool_error_result(
+                    "no_dex",
+                    "this dataset has resources but no DEX; query an input containing DEX",
+                ));
+            }
             if message.contains("archive input") {
                 return Ok(tool_error_result("not_archive", &message));
             }
@@ -1347,6 +902,9 @@ fn call_tool(p: &Value, state: &Arc<Mutex<State>>, cfg: &Config) -> Result<Value
             }
             if message.starts_with("offset ") || message.starts_with("offset must") {
                 return Ok(tool_error_result("invalid_range", &message));
+            }
+            if message.starts_with("entry is ") && message.contains("--max-resource-bytes") {
+                return Ok(tool_error_result("resource_too_large", &message));
             }
             if message.starts_with("kind must") {
                 return Ok(tool_error_result("invalid_input", &message));
@@ -1496,6 +1054,9 @@ fn open_dataset(
     }
     for path in &paths {
         std::fs::metadata(path).map_err(|error| (-32000, error.to_string()))?;
+    }
+    if let Some(reply) = input::validate(&paths, cfg) {
+        return Ok(reply["structuredContent"].clone());
     }
     let bytes = paths
         .iter()
@@ -1732,7 +1293,6 @@ fn query(a: &Value, state: &Arc<Mutex<State>>) -> Result<Value, (i32, String)> {
     if offset.saturating_add(limit) > 100_000 {
         return Err((-32602, "offset + limit must be at most 100000".into()));
     }
-    let max_bytes = checked_u64(a, "max_bytes")?;
     let started = Instant::now();
     let timing = a.get("timing").and_then(Value::as_bool).unwrap_or(false);
     let mut session = session
@@ -1753,7 +1313,6 @@ fn query(a: &Value, state: &Arc<Mutex<State>>) -> Result<Value, (i32, String)> {
             Err(error) => return Ok(sql_error(error, index)),
         }
     }
-    let mut names = std::collections::HashSet::new();
     for entry in named {
         let name = entry
             .get("name")
@@ -1764,25 +1323,28 @@ fn query(a: &Value, state: &Arc<Mutex<State>>) -> Result<Value, (i32, String)> {
             .and_then(Value::as_str)
             .ok_or((-32602, "named temporary query sql is required".into()))?;
         if name.is_empty() || !valid_identifier(name) {
-            return Err((-32602, format!("invalid temporary query name: {name}")));
-        }
-        if !names.insert(name.to_ascii_lowercase()) {
-            return Err((-32602, format!("duplicate temporary query: {name}")));
+            return Ok(
+                json!({"error":{"input":Value::Null,"kind":"invalid_input", "message":format!("invalid temp table name: {name}"),"source":Value::Null,"stage":"build_request","statement_index":Value::Null}}),
+            );
         }
         if let Err(error) = session.define(name, text) {
-            return Ok(sql_error(error, 0));
+            let mut value = sql_error(error, 0);
+            let message = value["error"]["message"].as_str().unwrap_or_default();
+            value["error"]["message"] =
+                json!(format!("named temporary query `{name}` body: {message}"));
+            value["error"]["statement_index"] = Value::Null;
+            return Ok(value);
         }
     }
     let mut statements = Vec::with_capacity(sql.len());
     for (index, statement) in validated.iter().enumerate() {
         let text = sql[index].as_str().expect("validated SQL string");
         let execute_started = Instant::now();
-        let result = match session.execute(statement, Some(&dataset)) {
+        let result = match session.execute_typed(statement, Some(&dataset)) {
             Ok(result) => result,
             Err(error) => return Ok(sql_error(error, index)),
         };
-        let mut value = literal_select(text.trim().trim_end_matches(';').trim(), index, text)
-            .unwrap_or_else(|| query_result_to_statement(&result, index, text));
+        let mut value = query_result_to_statement(&result, index, text.trim());
         if matches!(
             statement,
             dexsql_core::sql::ast::Statement::CreateDefinition { .. }
@@ -1793,9 +1355,6 @@ fn query(a: &Value, state: &Arc<Mutex<State>>) -> Result<Value, (i32, String)> {
             value["execute_ms"] = json!(execute_started.elapsed().as_secs_f64() * 1000.0);
         }
         apply_page(&mut value, offset, limit)?;
-        if let Some(max) = max_bytes {
-            truncate_statement_bytes(&mut value, max as usize);
-        }
         statements.push(value);
     }
     let rewrites = sql
@@ -1834,231 +1393,32 @@ fn valid_identifier(name: &str) -> bool {
         ch == '_' || ch.is_ascii_alphanumeric() && (i > 0 || ch.is_ascii_alphabetic())
     })
 }
-fn literal_select(text: &str, index: usize, sql: &str) -> Option<Value> {
-    let projection = text
-        .strip_prefix("SELECT")
-        .or_else(|| text.strip_prefix("select"))?
-        .trim();
-    if projection.is_empty() || projection.contains(" from ") || projection.contains(" FROM ") {
-        return None;
-    }
-    let mut columns = Vec::new();
-    let mut row = Vec::new();
-    for raw in projection.split(',') {
-        let expression = raw.trim();
-        let (expression, name) = if let Some((value, alias)) = expression.rsplit_once(" AS ") {
-            (value.trim(), alias.trim().to_owned())
-        } else if let Some((value, alias)) = expression.rsplit_once(" as ") {
-            (value.trim(), alias.trim().to_owned())
-        } else {
-            (expression, "column".to_owned())
-        };
-        let is_null = expression.eq_ignore_ascii_case("null");
-        let cell = if is_null {
-            json!({"type":"null","value":Value::Null})
-        } else if expression.len() >= 3
-            && (expression.starts_with("x'") || expression.starts_with("X'"))
-            && expression.ends_with('\'')
-            && expression[2..expression.len() - 1].len() % 2 == 0
-            && expression[2..expression.len() - 1]
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-        {
-            json!({"type":"binary","value":expression[2..expression.len() - 1].to_ascii_lowercase()})
-        } else if let Ok(value) = expression.parse::<i64>() {
-            if value < 0 {
-                typed_i64(value)
-            } else {
-                typed_u64(value as u64)
-            }
-        } else if let Ok(value) = expression.parse::<u64>() {
-            if value <= i64::MAX as u64 {
-                typed_u64(value)
-            } else {
-                typed_f64(value as f64)
-            }
-        } else if let Ok(value) = expression.parse::<f64>() {
-            typed_f64(value)
-        } else if expression.len() >= 2
-            && expression.starts_with('\'')
-            && expression.ends_with('\'')
-        {
-            typed_utf8(&expression[1..expression.len() - 1])
-        } else {
-            return None;
-        };
-        columns.push(json!({"name":name,"data_type":"sqlite_dynamic","nullable":is_null || cell.get("type").and_then(Value::as_str) == Some("binary")}));
-        row.push(cell);
-    }
-    Some(
-        json!({"statement_index":index,"sql":sql,"kind":"query","columns":columns,"rows":[row],"total_rows":1,"truncated":false,"offset":0,"next_offset":Value::Null}),
-    )
-}
-
-fn query_result_to_statement(result: &query_engine::QueryResult, index: usize, sql: &str) -> Value {
-    let sql_lower = sql.to_ascii_lowercase();
+fn query_result_to_statement(
+    result: &query_engine::TypedQueryResult,
+    index: usize,
+    sql: &str,
+) -> Value {
     let columns = result
         .columns
         .iter()
-        .enumerate()
-        .map(|(index, name)| {
-            let lookup_name = name
-                .rsplit_once('.')
-                .map_or(name.as_str(), |(_, value)| value);
-            let meta = schema::TABLES.iter().find_map(|table| {
-                table
-                    .columns
-                    .iter()
-                    .find(|column| column.name.eq_ignore_ascii_case(lookup_name))
-            });
-            let data_type = meta
-                .map(|column| match column.sql_type {
-                    "UInt32" | "UInt64" => "uint64",
-                    "Int64" => "int64",
-                    "Float64" => "float64",
-                    "Utf8" | "Utf8View" => "utf8",
-                    "Binary" => "binary",
-                    _ => "sqlite_dynamic",
-                })
-                .unwrap_or_else(|| {
-                    if sql_lower.contains("count(") {
-                        "uint64"
-                    } else {
-                        "sqlite_dynamic"
-                    }
-                });
-            let nullable = if sql_lower.contains("count(") {
-                false
-            } else {
-                meta.map_or_else(
-                    || {
-                        sql_lower
-                            .split(" from ")
-                            .next()
-                            .is_some_and(|projection| projection.contains('('))
-                            || result.rows.iter().any(|row| {
-                                row.get(index)
-                                    .is_none_or(|value| value.eq_ignore_ascii_case("null"))
-                            })
-                    },
-                    |column| column.nullable,
-                )
-            };
+        .map(|column| {
             json!({
-                "name": name,
-                "data_type": data_type,
-                "nullable": nullable
+                "name":column.name,"data_type":column.data_type,"nullable":column.nullable
             })
         })
         .collect::<Vec<_>>();
-    let rows = result
-        .rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(column, value)| {
-                    let data_type = columns
-                        .get(column)
-                        .and_then(|column| column.get("data_type"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("sqlite_dynamic");
-                    rendered_cell(value, data_type)
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    json!({
-        "statement_index": index,
-        "sql": sql,
-        "kind": "query",
-        "columns": columns,
-        "rows": rows,
-        "total_rows": result.rows.len(),
-        "truncated": false,
-        "offset": 0
-    })
+    let rows = result.rows.iter().map(|row| row.iter().map(|value| match value {
+        query_engine::TypedValue::Null => json!({"type":"null","value":Value::Null}),
+        query_engine::TypedValue::UInt64(value) => typed_u64(*value),
+        query_engine::TypedValue::Int64(value) => typed_i64(*value),
+        query_engine::TypedValue::Float64(value) => typed_f64(*value),
+        query_engine::TypedValue::Utf8(value) => typed_utf8(value),
+        query_engine::TypedValue::Binary(value) => json!({"type":"binary","value":value.iter().map(|byte| format!("{byte:02x}")).collect::<String>()}),
+    }).collect::<Vec<_>>()).collect::<Vec<_>>();
+    json!({"statement_index":index,"sql":sql,"kind":"query","columns":columns,
+        "rows":rows,"total_rows":result.rows.len(),"truncated":false,"offset":0})
 }
 
-fn rendered_cell(value: &str, data_type: &str) -> Value {
-    if value.eq_ignore_ascii_case("null") {
-        return json!({"type":"null","value":Value::Null});
-    }
-    let base = data_type.trim_end_matches('?');
-    if base.eq_ignore_ascii_case("uint32") {
-        if let Ok(n) = value.parse::<u32>() {
-            return typed_u32(n);
-        }
-    } else if base.eq_ignore_ascii_case("uint64") {
-        if let Ok(n) = value.parse::<u64>() {
-            return typed_u64(n);
-        }
-    } else if base.eq_ignore_ascii_case("int64") {
-        if let Ok(n) = value.parse::<i64>() {
-            return typed_i64(n);
-        }
-    } else if base.eq_ignore_ascii_case("float64") {
-        if let Ok(n) = value.parse::<f64>() {
-            return typed_f64(n);
-        }
-    } else if base.eq_ignore_ascii_case("utf8") {
-        return typed_utf8(unescape_engine_text(value));
-    } else if base.eq_ignore_ascii_case("binary") {
-        return json!({"type":"binary","value":unescape_engine_text(value)});
-    }
-    if let Ok(n) = value.parse::<i64>() {
-        if n < 0 {
-            typed_i64(n)
-        } else {
-            typed_u64(n as u64)
-        }
-    } else if let Ok(n) = value.parse::<f64>() {
-        typed_f64(n)
-    } else {
-        typed_utf8(unescape_engine_text(value))
-    }
-}
-
-/// The CLI Scalar renderer escapes control characters for its text table.
-/// MCP cells carry the original UTF-8 string and therefore must undo that
-/// presentation escaping before serialization.
-fn unescape_engine_text(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    let mut chars = value.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '\\' {
-            out.push(ch);
-            continue;
-        }
-        match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('r') => out.push('\r'),
-            Some('t') => out.push('\t'),
-            Some('u') => {
-                let mut code = String::new();
-                if chars.next() == Some('{') {
-                    for ch in chars.by_ref() {
-                        if ch == '}' {
-                            break;
-                        }
-                        code.push(ch);
-                    }
-                }
-                if let Ok(value) = u32::from_str_radix(&code, 16) {
-                    if let Some(decoded) = char::from_u32(value) {
-                        out.push(decoded);
-                    }
-                }
-            }
-            Some(other) => {
-                out.push('\\');
-                out.push(other);
-            }
-            None => out.push('\\'),
-        }
-    }
-    out
-}
 fn apply_page(statement: &mut Value, offset: usize, limit: usize) -> Result<(), (i32, String)> {
     let Some(object) = statement.as_object_mut() else {
         return Ok(());
@@ -2087,32 +1447,6 @@ fn apply_page(statement: &mut Value, offset: usize, limit: usize) -> Result<(), 
         if end < total { json!(end) } else { Value::Null },
     );
     Ok(())
-}
-fn truncate_statement_bytes(statement: &mut Value, max: usize) {
-    loop {
-        let too_large = serde_json::to_vec(&*statement)
-            .map(|bytes| bytes.len())
-            .unwrap_or(usize::MAX)
-            > max;
-        if !too_large {
-            break;
-        }
-        let popped = statement
-            .get_mut("rows")
-            .and_then(Value::as_array_mut)
-            .and_then(Vec::pop)
-            .is_some();
-        if !popped {
-            break;
-        }
-    }
-    if let Some(object) = statement.as_object_mut() {
-        object.insert("bytes_limited".into(), json!(true));
-    }
-}
-
-fn typed_u32(value: u32) -> Value {
-    json!({"type":"uint32","value":value})
 }
 fn typed_u64(value: u64) -> Value {
     json!({"type":"uint64","value":value.to_string()})
@@ -2300,7 +1634,8 @@ fn decode_tool(a: &Value, state: &Arc<Mutex<State>>, cfg: &Config) -> Result<Val
             match render_method(file, idx, Some(definition.access_flags), mode) {
                 Ok((declaration, text)) => {
                     row["declaration"] = json!(declaration);
-                    if add_smali_page(&mut row, &text, offset, max_bytes, Some(max_lines)).is_err()
+                    if add_smali_page(&mut row, &text, offset, max_bytes / 2, Some(max_lines))
+                        .is_err()
                     {
                         return Ok(failure("invalid_range", "offset must be a UTF-8 boundary within the text; use the returned next_offset"));
                     }
@@ -2330,77 +1665,21 @@ fn decode_tool(a: &Value, state: &Arc<Mutex<State>>, cfg: &Config) -> Result<Val
         } else {
             Value::Null
         };
-        if decode_result_bytes(&result, compact) > max_bytes {
-            let row_index = returned - 1;
-            if let Some(text) = text {
-                // Prefer complete lines. If one line is longer than the whole
-                // budget, the last resort is a UTF-8-safe prefix of that line.
-                let current_len = result["methods"][row_index]["smali"]
-                    .as_str()
-                    .map_or(0, str::len);
-                let mut boundaries = text[offset..offset + current_len]
-                    .match_indices('\n')
-                    .map(|(i, _)| i + 1)
-                    .collect::<Vec<_>>();
-                if boundaries.last().copied() != Some(current_len) {
-                    boundaries.push(current_len);
-                }
-                let mut low = 0;
-                let mut high = boundaries.len();
-                while low < high {
-                    let mid = low + (high - low) / 2;
-                    add_smali_page(
-                        &mut result["methods"][row_index],
-                        &text,
-                        offset,
-                        boundaries[mid],
-                        Some(max_lines),
-                    )?;
-                    if decode_result_bytes(&result, compact) <= max_bytes {
-                        low = mid + 1;
-                    } else {
-                        high = mid;
-                    }
-                }
-                if low > 0 {
-                    add_smali_page(
-                        &mut result["methods"][row_index],
-                        &text,
-                        offset,
-                        boundaries[low - 1],
-                        Some(max_lines),
-                    )?;
-                    break;
-                }
-                if returned == 1 {
-                    let mut low = 0;
-                    let mut high = current_len;
-                    while low < high {
-                        let mid = low + (high - low).div_ceil(2);
-                        add_smali_page(
-                            &mut result["methods"][row_index],
-                            &text,
-                            offset,
-                            mid,
-                            Some(max_lines),
-                        )?;
-                        if decode_result_bytes(&result, compact) <= max_bytes {
-                            low = mid;
-                        } else {
-                            high = mid - 1;
-                        }
-                    }
-                    add_smali_page(
-                        &mut result["methods"][row_index],
-                        &text,
-                        offset,
-                        low,
-                        Some(max_lines),
-                    )?;
-                    if low > 0 {
-                        break;
-                    }
-                }
+        let row_index = returned - 1;
+        let mut page_cap = max_bytes / 2;
+        let mut reduced = false;
+        while decode_result_bytes(&result, compact) > max_bytes {
+            if let Some(text) = text.as_ref().filter(|_| page_cap > 9) {
+                page_cap /= 2;
+                add_smali_page(
+                    &mut result["methods"][row_index],
+                    text,
+                    offset,
+                    page_cap,
+                    Some(max_lines),
+                )?;
+                reduced = true;
+                continue;
             }
             result["methods"]
                 .as_array_mut()
@@ -2408,11 +1687,13 @@ fn decode_tool(a: &Value, state: &Arc<Mutex<State>>, cfg: &Config) -> Result<Val
                 .pop();
             result["next_method_offset"] = json!(next_method - 1);
             if returned == 1 {
-                return Ok(failure(
-                    "output_limit",
-                    "serialized result exceeds --max-output-bytes",
-                ));
+                return Ok(
+                    json!({"error":{"kind":"output_too_large","message":"method metadata exceeds max_bytes"}}),
+                );
             }
+            return Ok(result);
+        }
+        if reduced {
             break;
         }
     }
@@ -2433,14 +1714,7 @@ fn decode_error(
 }
 
 fn decode_result_bytes(value: &Value, compact: bool) -> usize {
-    let content = if compact {
-        json!([])
-    } else {
-        json!([{"type":"text", "text":value.to_string()}])
-    };
-    json!({"content":content, "structuredContent":value, "isError":false})
-        .to_string()
-        .len()
+    budget::serialized_bytes(value, compact)
 }
 
 fn render_method(
@@ -2501,6 +1775,11 @@ fn add_smali_page(
     while end > 0 && !tail.is_char_boundary(end) {
         end -= 1;
     }
+    if end < tail.len() {
+        if let Some(newline) = tail[..end].rfind('\n') {
+            end = newline + 1;
+        }
+    }
     if let Some(limit) = max_lines {
         if let Some((last, _)) = tail[..end].match_indices('\n').nth(limit - 1) {
             end = last + 1;
@@ -2535,11 +1814,6 @@ fn query_resources(a: &Value, state: &Arc<Mutex<State>>) -> Result<Value, (i32, 
         None => 100,
         Some(value) if (1..=200).contains(&(value as usize)) => value as usize,
         Some(_) => return Err((-32602, "limit must be between 1 and 200".into())),
-    };
-    let max_bytes = match checked_u64(a, "max_bytes")? {
-        None => 131_072,
-        Some(value) if (4_096..=131_072).contains(&value) => value as usize,
-        Some(_) => return Err((-32602, "max_bytes must be in 4096..=131072".into())),
     };
     let mut g = state
         .lock()
@@ -2634,35 +1908,6 @@ fn query_resources(a: &Value, state: &Arc<Mutex<State>>) -> Result<Value, (i32, 
     let start = offset.min(total);
     let end = (start + limit).min(total);
     let mut page = rows[start..end].to_vec();
-    // MCP carries both a text and structured copy of the result.  The native
-    // service accounts both serialized copies while paging resource metadata;
-    // keep the internal resource_type key in this accounting, then remove it
-    // from the public rows below.
-    while !page.is_empty() {
-        let next = if start + page.len() < total {
-            Some(start + page.len())
-        } else {
-            None::<usize>
-        };
-        let probe = json!({
-            "dataset_id": id,
-            "input_index": a.get("input_index").cloned().unwrap_or_else(|| json!(0)),
-            "next_offset": next,
-            "offset": offset,
-            "reference_policy": "references are named, not recursively evaluated; query the referenced ID and configuration to continue",
-            "total_rows": total,
-            "truncated": next.is_some(),
-            "values": &page,
-        });
-        let bytes = serde_json::to_vec(&probe).map_or(usize::MAX, |value| value.len());
-        if bytes.saturating_mul(2) <= max_bytes {
-            break;
-        }
-        page.pop();
-    }
-    if page.is_empty() && start < total {
-        return Err((-32000, "resource metadata exceeds max_bytes".into()));
-    }
     // resource_type is an implementation detail used for filtering.  The
     // reference result schema exposes only the resource name and value type.
     for row in &mut page {
@@ -2673,7 +1918,7 @@ fn query_resources(a: &Value, state: &Arc<Mutex<State>>) -> Result<Value, (i32, 
     let page_end = start + page.len();
     Ok(json!({
         "dataset_id": id,
-        "input_index": a.get("input_index").cloned().unwrap_or_else(|| json!(0)),
+        "input_index": a.get("input_index").filter(|value| !value.is_null()).cloned().unwrap_or_else(|| json!(0)),
         "next_offset": if page_end < total { Some(page_end) } else { None::<usize> },
         "offset": offset,
         "reference_policy": "references are named, not recursively evaluated; query the referenced ID and configuration to continue",
@@ -2927,7 +2172,7 @@ fn is_archive(path: &Path) -> bool {
 fn archive_contains_dex(path: &Path) -> bool {
     raw_zip_names(path)
         .iter()
-        .any(|name| name.to_ascii_lowercase().ends_with(".dex"))
+        .any(|name| name.ends_with(".dex"))
 }
 fn zip_path(entry: &Entry, input_index: Option<usize>) -> Result<&PathBuf, (i32, String)> {
     let archives = entry
@@ -3046,6 +2291,16 @@ fn list_resource_files(a: &Value, state: &Arc<Mutex<State>>) -> Result<Value, (i
             .and_then(Value::as_u64)
             .map(|x| x as usize),
     )?;
+    let resolved_index = a
+        .get("input_index")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or_else(|| {
+            e.paths
+                .iter()
+                .position(|candidate| std::ptr::eq(candidate, path))
+                .unwrap_or(0)
+        });
     let file = std::fs::File::open(path).map_err(|x| (-32000, x.to_string()))?;
     let mut zip = ZipArchive::new(file).map_err(|x| (-32000, format!("invalid archive: {x}")))?;
     let raw_names = raw_zip_names(path);
@@ -3069,12 +2324,18 @@ fn list_resource_files(a: &Value, state: &Arc<Mutex<State>>) -> Result<Value, (i
         }));
     }
     rows.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+    if offset > rows.len() {
+        return Err((
+            -32602,
+            format!("offset {offset} exceeds total_rows {}", rows.len()),
+        ));
+    }
     let start = offset.min(rows.len());
     let end = (start + limit).min(rows.len());
     Ok(json!({
         "dataset_id": id,
         "files": rows[start..end],
-        "input_index": a.get("input_index").cloned().unwrap_or_else(|| json!(0)),
+        "input_index": json!(resolved_index),
         "next_offset": if end < rows.len() { Some(end) } else { None::<usize> },
         "offset": offset,
         "total_rows": rows.len(),
@@ -3135,7 +2396,13 @@ fn archive_resource(
         .by_index(entry_index)
         .map_err(|_| (-32004, format!("archive entry not found: {name}")))?;
     if item.size() > resource_limit {
-        return Err((-32000, "resource exceeds size limit".into()));
+        return Err((
+            -32000,
+            format!(
+                "entry is {} bytes; --max-resource-bytes is {resource_limit}",
+                item.size()
+            ),
+        ));
     }
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut item, &mut bytes).map_err(|x| (-32000, x.to_string()))?;
@@ -3854,8 +3121,11 @@ mod tests {
     }
     #[test]
     fn literal_query_cells_are_typed() {
-        let statement =
-            literal_select("SELECT 1, -1, 1.5, NULL", 0, "SELECT 1, -1, 1.5, NULL").unwrap();
+        let mut session = query_engine::QuerySession::default();
+        let sql = "SELECT 1, -1, 1.5, NULL";
+        let validated = query_engine::QuerySession::validate(sql).unwrap();
+        let result = session.execute_typed(&validated, None).unwrap();
+        let statement = query_result_to_statement(&result, 0, sql);
         assert_eq!(
             statement["rows"][0][0],
             json!({"type":"uint64","value":"1"})

@@ -71,13 +71,19 @@ session executor, sharing each immutable dataset and retaining temporary
 definitions between requests. Resource tools parse complete manifests before
 applying output pagination.
 
+Heavy operations run through one bounded queue. Each open dataset is owned by a
+dedicated hidden `mcp --worker` child using newline JSON IPC; the parent kills
+and reaps that child on timeout, cancellation, or malformed/oversized replies.
+The execution semaphore permits one heavy operation at a time while accepted
+queued work retains its dataset quota. EOF drains accepted requests before
+workers are reaped.
+
 Compatibility tests cover protocol negotiation, request validation, SQL
 sessions, typed errors, byte offsets, smali pages, and archive resources.
 Only documentation branding changes `DexSQL` to `dexsql`; reference diagnostic
 strings retain their original spelling.
 
-Two boundaries remain: expensive MCP work still runs on blocking threads,
-whereas the reference terminates a worker process on timeout; rewrite-count
-diagnostics use recovered structural rules with the existing trace fallback
-for complex plans. Passing the recorded cases does not establish complete
-equivalence outside that corpus.
+Optimizer diagnostics use recovered structural rules with a fallback for plans
+outside the measured reference corpus. Queries without a complete ordering key
+retain the reference's unspecified tie ordering; differential tests compare
+those rows by their defined stable fields.

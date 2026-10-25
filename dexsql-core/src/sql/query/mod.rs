@@ -43,8 +43,10 @@ mod physical_methods;
 mod relational;
 mod scalar_functions;
 mod streaming;
+mod typed;
 
 pub use error::{render_caused_by, render_flat_chain, DexSqlError};
+pub use typed::{OutputColumn, TypedQueryResult, TypedValue};
 
 /// Relation names accepted by the scan dispatcher.  Session definitions are
 /// validated against this set when a `CREATE ... AS query` statement names
@@ -112,28 +114,6 @@ const RELATION_NAMES: &[&str] = &[
 struct CachedTable {
     columns: Vec<String>,
     rows: Vec<Vec<Scalar>>,
-}
-
-impl CachedTable {
-    fn from_result(result: QueryResult) -> Self {
-        let columns = result.columns;
-        let rows = result
-            .rows
-            .into_iter()
-            .map(|row| {
-                columns
-                    .iter()
-                    .enumerate()
-                    .map(|(index, _)| {
-                        row.get(index)
-                            .map(|value| scalar_from_rendered(value))
-                            .unwrap_or(Scalar::Null)
-                    })
-                    .collect()
-            })
-            .collect();
-        Self { columns, rows }
-    }
 }
 
 /// Named `--cache` definitions are request-local virtual tables.  Keep their
@@ -237,8 +217,8 @@ impl NamedCaches {
     /// Install an already-materialized result as a scope-local table,
     /// shadowing any same-named definition.
     fn install_materialized(&self, name: &str, typed: (Vec<String>, Vec<Vec<Scalar>>)) {
-        let result = typed_to_result(typed);
-        let table = Arc::new(CachedTable::from_result(result));
+        let (columns, rows) = typed;
+        let table = Arc::new(CachedTable { columns, rows });
         self.definitions
             .borrow_mut()
             .remove(&name.to_ascii_lowercase());
@@ -275,10 +255,10 @@ impl NamedCaches {
             ));
         }
         let started = Instant::now();
-        let result = execute_statement(&sql, dataset, self, None);
+        let result = typed::execute_rows(&sql, dataset, self);
         self.loading.borrow_mut().remove(&name);
-        let result = result?;
-        let table = Arc::new(CachedTable::from_result(result));
+        let (columns, rows) = result?;
+        let table = Arc::new(CachedTable { columns, rows });
         self.tables.borrow_mut().insert(name, table.clone());
         self.materialize_ms
             .set(self.materialize_ms.get() + started.elapsed().as_secs_f64() * 1000.0);
@@ -408,6 +388,12 @@ impl QuerySession {
 
     pub fn define(&mut self, name: &str, sql: &str) -> Result<(), DexSqlError> {
         validate_single(sql)?;
+        // Named query definitions are request inputs; repeated names replace
+        // earlier entries just like repeated --cache definitions.
+        self.caches
+            .session_created
+            .borrow_mut()
+            .remove(&name.to_ascii_lowercase());
         self.caches.define_session(name, sql, false)
     }
 
@@ -2388,21 +2374,6 @@ impl Scalar {
     fn sql_eq(&self, other: &Self) -> bool {
         membership::equal(self, other)
     }
-}
-
-fn scalar_from_rendered(value: &str) -> Scalar {
-    if value.eq_ignore_ascii_case("null") {
-        return Scalar::Null;
-    }
-    if let Ok(number) = value.parse::<i64>() {
-        return Scalar::Int(number);
-    }
-    if (value.contains('.') || value.contains('e') || value.contains('E'))
-        && value.parse::<f64>().is_ok()
-    {
-        return Scalar::Real(value.to_owned());
-    }
-    Scalar::text(value.to_owned())
 }
 
 fn escape_text(value: &str) -> String {
@@ -5197,6 +5168,7 @@ fn execute_query(
 /// Materialized output of a set expression: column labels and typed rows.
 type SetRows = (Vec<String>, Vec<Vec<Scalar>>);
 
+#[cfg(test)]
 fn typed_to_result((columns, rows): SetRows) -> QueryResult {
     QueryResult {
         columns,
@@ -11435,6 +11407,9 @@ fn eval_scalar(
 }
 
 fn aggregate_real_scalar(value: f64) -> Scalar {
+    if typed::retains_precision() {
+        return Scalar::Real(value.to_string());
+    }
     // Aggregate REAL results use 15 significant decimal digits in the
     // reference, including AVG's recurring fractional results.
     let rounded = if value.is_finite() {

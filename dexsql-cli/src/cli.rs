@@ -431,6 +431,8 @@ struct HelpArgs {
 
 #[derive(Debug, Args)]
 struct McpArgs {
+    #[arg(long, hide = true)]
+    worker: bool,
     #[arg(
         long,
         default_value_t = 60_000,
@@ -487,17 +489,26 @@ where
         Command::PrepareCache(args) => run_prepare_cache(args, cli.threads, cli.trusted_input),
         Command::QueryCache(args) => run_query_cache(args, cli.threads, cli.trusted_input),
         Command::Decode(args) => run_decode(args),
-        Command::Mcp(args) => crate::mcp::serve_stdio(crate::mcp::Config {
-            timeout_ms: args.timeout_ms,
-            max_datasets: args.max_datasets,
-            max_pending: args.max_pending,
-            max_input_bytes: args.max_input_bytes,
-            max_dex_bytes: args.max_dex_bytes,
-            max_total_input_bytes: args.max_total_input_bytes,
-            max_output_bytes: args.max_output_bytes,
-            max_resource_bytes: args.max_resource_bytes,
-        })
-        .map_err(|e| CliError::Runtime(e.to_string())),
+        Command::Mcp(args) => {
+            if args.worker {
+                dexsql_core::dex::configure_thread_pool(cli.threads);
+                return crate::mcp::serve_worker().map_err(|_| CliError::Usage(2));
+            }
+            crate::mcp::serve_stdio(
+                crate::mcp::Config {
+                    timeout_ms: args.timeout_ms,
+                    max_datasets: args.max_datasets,
+                    max_pending: args.max_pending,
+                    max_input_bytes: args.max_input_bytes,
+                    max_dex_bytes: args.max_dex_bytes,
+                    max_total_input_bytes: args.max_total_input_bytes,
+                    max_output_bytes: args.max_output_bytes,
+                    max_resource_bytes: args.max_resource_bytes,
+                },
+                cli.threads,
+            )
+            .map_err(|e| CliError::Runtime(e.to_string()))
+        }
         Command::Extract(_) => Err(CliError::Runtime(
             "command is not implemented in this restoration build".into(),
         )),

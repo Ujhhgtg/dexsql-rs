@@ -395,6 +395,7 @@ dependencies = [
  "dexsql-core",
  "futures-util",
  "rmcp",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-util",

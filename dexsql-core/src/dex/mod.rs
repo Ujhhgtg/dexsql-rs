@@ -4299,7 +4299,7 @@ fn load_archive(
         path,
         target_file_id.map(|target| target.saturating_sub(base) as usize),
         |index, name, bytes| {
-            let mut file = parse_dex(
+            let parsed = parse_dex(
                 bytes,
                 base + index as u32,
                 path.to_path_buf(),
@@ -4309,16 +4309,43 @@ fn load_archive(
                 full_code_items,
                 retain_classes,
             )
-            .map_err(|e| crate::archive::InflateError(e.to_string()))?;
-            if !retain_raw_bytes {
-                file.drop_raw_bytes();
-            }
-            Ok(file)
+            .map(|mut file| {
+                if !retain_raw_bytes {
+                    file.drop_raw_bytes();
+                }
+                file
+            });
+            Ok(parsed)
         },
     )
     .map_err(|e| LoadError(format!("invalid ZIP/APK {}: {e}", path.display())))?;
-    files.extend(parsed);
-    Ok(base + dex_count)
+    let mut loaded = Vec::with_capacity(parsed.len());
+    let mut first_error = None;
+    for result in parsed {
+        match result {
+            Ok(mut file) => {
+                if target_file_id.is_none() {
+                    file.file_id = base + loaded.len() as u32;
+                }
+                loaded.push(file);
+            }
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    if loaded.is_empty() {
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+    }
+    let next = if target_file_id.is_none() {
+        base + loaded.len() as u32
+    } else {
+        base + dex_count
+    };
+    files.extend(loaded);
+    Ok(next)
 }
 
 fn parse_dex(
