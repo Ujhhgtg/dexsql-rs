@@ -2,7 +2,7 @@
 //! `*Data` API.
 //!
 //! [`Engine::metadata`](crate::Engine::metadata) resolves one class, method, or
-//! field descriptor through the indexed lookups in `dexsql_cache::metadata` and
+//! field descriptor through the indexed lookups in `dexsql_core::dex::metadata` and
 //! renders the JSON document documented below. The format mirrors DexKit's
 //! Kotlin `*Data` model so the WeKit JNI bridge and the Kotlin replacement layer
 //! can be validated against the Phase 0 DexKit snapshot without further
@@ -117,7 +117,7 @@
 //! [`Engine::metadata_callers`](crate::Engine::metadata_callers) when a
 //! consumer needs them (Phase 4).
 //!
-//! `using_numbers` collapses DexSQL's six SQL literal labels into the two
+//! `using_numbers` collapses dexsql's six SQL literal labels into the two
 //! DexKit literal families: `float`/`double` literals use `kind = "double"`
 //! (the string is the floating value), and `byte`/`short`/`int`/`long`
 //! literals use `kind = "long"` (the string is the signed integer value).
@@ -131,12 +131,12 @@
 //!   `callers`, `using_strings`, `using_numbers`, and `using_fields` are empty
 //!   arrays rather than errors.
 
-use dexsql_cache::metadata::{
+use dexsql_core::dex::metadata::{
     class_descriptor_to_name, class_modifiers, descriptor_to_type_name, field_access_is_read,
     field_modifiers, method_modifiers, simple_type_name, ClassLocation, CrossRefCache,
     FieldLocation, MetaQuery, MethodDescriptorParts, MethodLocation,
 };
-use dexsql_cache::{Dataset, DexFile, MethodNumberRef};
+use dexsql_core::dex::{Dataset, DexFile, MethodNumberRef};
 
 use crate::annotations;
 use crate::opcodes;
@@ -427,7 +427,7 @@ pub(crate) fn callers_json_for_descriptor(
     cross: &CrossRefCache,
     descriptor: &str,
 ) -> Result<Value, String> {
-    dexsql_cache::metadata::parse_method_descriptor(descriptor)?;
+    dexsql_core::dex::metadata::parse_method_descriptor(descriptor)?;
     match dataset.locate_method(descriptor)? {
         None => Ok(Value::Null),
         Some(location) => {
@@ -610,7 +610,7 @@ fn field_ref_flags(
 
 fn number_json(reference: &MethodNumberRef) -> Value {
     let (kind, value) = match (reference.double_value, reference.opcode) {
-        // DexSQL's SQL label calls const/high16 + const (0x14/0x15) float and
+        // dexsql's SQL label calls const/high16 + const (0x14/0x15) float and
         // const-wide/high16 (0x19) double; every other literal is an integer.
         (Some(double), 0x14 | 0x15 | 0x19) => ("double", format_double(double)),
         _ => ("long", reference.long_value.to_string()),

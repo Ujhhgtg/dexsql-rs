@@ -14,8 +14,8 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use dexsql_cache::{Dataset, IndexNeeds};
-use dexsql_query::{execute_statement, NamedCaches};
+use dexsql_core::dex::{Dataset, IndexNeeds};
+use dexsql_core::sql::query::{execute_statement, NamedCaches};
 
 fn required_env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("missing environment variable {name}"))

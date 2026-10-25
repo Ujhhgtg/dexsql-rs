@@ -12,5 +12,4 @@ path = "src/lib.rs"
 
 [dependencies]
 serde_json = "1"
-dexsql-cache = { path = "../dexsql-cache" }
-dexsql-query = { path = "../dexsql-query" }
+dexsql-core = { path = "../dexsql-core" }

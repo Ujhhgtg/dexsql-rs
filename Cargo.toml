@@ -1,19 +1,10 @@
 [workspace]
 members = [
-    "cli",
-    "dexsql-ast",
-    "dexsql-cache",
-    "dexsql-exec",
-    "dexsql-inflate",
-    "dexsql-ir",
-    "dexsql-lower",
-    "dexsql-mutf8",
-    "dexsql-optimizer",
-    "dexsql-query",
-    "dexsql-schema",
-    "dexsql-mcp",
+    "dexsql-cli",
+    "dexsql-core",
     "dexsql",
 ]
+default-members = ["dexsql-cli", "dexsql"]
 resolver = "2"
 
 [workspace.package]

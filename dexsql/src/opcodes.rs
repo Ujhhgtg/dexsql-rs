@@ -5,7 +5,7 @@
 //! mnemonic names so DexKit opNames-style consumers can inspect it directly.
 //! Payload pseudo-instructions are skipped exactly like the SQL projection.
 
-use dexsql_cache::DexFile;
+use dexsql_core::dex::DexFile;
 
 const UNUSED: &str = "unused";
 
@@ -317,7 +317,7 @@ pub(crate) fn method_opcode_names(
 #[cfg(test)]
 mod tests {
     use super::{method_opcode_names, opcode_mnemonic};
-    use dexsql_cache::{CodeItem, Dataset};
+    use dexsql_core::dex::{CodeItem, Dataset};
     use std::path::PathBuf;
 
     #[test]

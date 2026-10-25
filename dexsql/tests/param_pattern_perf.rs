@@ -7,7 +7,7 @@
 //! cargo test -p dexsql --release --test param_pattern_perf -- --ignored --nocapture
 //! ```
 //!
-//! The fast path is the descriptor-lookup executor in `dexsql-query`; the
+//! The fast path is the descriptor-lookup executor in `dexsql-core::sql::query`; the
 //! generic variant appends a constant conjunct (`AND 1 = 1`) so the same query
 //! falls back to the generic relation executor. Both forms must return the same
 //! rows.
@@ -15,8 +15,8 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use dexsql_cache::{Dataset, IndexNeeds};
-use dexsql_query::{execute_statement, NamedCaches};
+use dexsql_core::dex::{Dataset, IndexNeeds};
+use dexsql_core::sql::query::{execute_statement, NamedCaches};
 
 fn required_env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("missing environment variable {name}"))

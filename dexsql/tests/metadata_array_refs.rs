@@ -122,7 +122,7 @@ fn real_apk_method_documents_with_array_refs_are_ok() {
         std::env::var("DEXSQL_META_REGRESSION_APK")
             .expect("set DEXSQL_META_REGRESSION_APK to a DEX/APK file"),
     );
-    let dataset = dexsql_cache::Dataset::load_paths_with_requirements(
+    let dataset = dexsql_core::dex::Dataset::load_paths_with_requirements(
         std::slice::from_ref(&apk),
         IndexNeeds::all(),
         true,

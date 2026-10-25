@@ -1,7 +1,7 @@
 //! Stable embedded API for querying DEX files and APKs.
 //!
-//! The command line and MCP crates intentionally remain outside this API.  An
-//! [`Engine`] owns one immutable [`dexsql_cache::Dataset`] and can be shared by
+//! The command line and MCP frontend live in `dexsql-cli`. An
+//! [`Engine`] owns one immutable [`dexsql_core::dex::Dataset`] and can be shared by
 //! callers that need to resolve many descriptors from the same host APK.
 
 use std::collections::HashMap;
@@ -9,11 +9,11 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use dexsql_cache::metadata::CrossRefCache;
-pub use dexsql_cache::IndexNeeds;
-pub use dexsql_cache::MetaQuery;
-use dexsql_cache::{Dataset, LoadError};
-use dexsql_query::{execute_statement, NamedCaches};
+use dexsql_core::dex::metadata::CrossRefCache;
+pub use dexsql_core::dex::IndexNeeds;
+pub use dexsql_core::dex::MetaQuery;
+use dexsql_core::dex::{Dataset, LoadError};
+use dexsql_core::sql::query::{execute_statement, NamedCaches};
 
 mod annotations;
 mod metadata;
@@ -56,8 +56,8 @@ pub struct ResultSet {
     pub rows: Vec<Vec<String>>,
 }
 
-impl From<dexsql_query::QueryResult> for ResultSet {
-    fn from(value: dexsql_query::QueryResult) -> Self {
+impl From<dexsql_core::sql::query::QueryResult> for ResultSet {
+    fn from(value: dexsql_core::sql::query::QueryResult) -> Self {
         Self {
             columns: value.columns,
             rows: value.rows,
@@ -127,7 +127,7 @@ impl Engine {
         if paths.is_empty() {
             return Err(Error::Load("at least one input path is required".into()));
         }
-        dexsql_cache::configure_thread_pool(options.threads);
+        dexsql_core::dex::configure_thread_pool(options.threads);
         let dataset = Dataset::load_paths_with_requirements(
             &paths,
             options.index_needs,
@@ -218,7 +218,7 @@ impl Engine {
         if let Some(cached) = self
             .result_cache
             .lock()
-            .expect("DexSQL result cache mutex poisoned")
+            .expect("dexsql result cache mutex poisoned")
             .get(sql)
             .cloned()
         {
@@ -230,14 +230,14 @@ impl Engine {
             &self
                 .named_caches
                 .lock()
-                .expect("DexSQL named cache mutex poisoned"),
+                .expect("dexsql named cache mutex poisoned"),
             None,
         )
         .map(ResultSet::from)
         .map_err(Error::Query)?;
         self.result_cache
             .lock()
-            .expect("DexSQL result cache mutex poisoned")
+            .expect("dexsql result cache mutex poisoned")
             .insert(sql.to_owned(), result.clone());
         Ok(result)
     }

@@ -21,17 +21,6 @@ fn engine() -> Engine {
     Engine::open([fixture("alpha.dex"), fixture("beta.dex")]).expect("open fixture DEX files")
 }
 
-fn query_descriptors(engine: &Engine, sql: &str) -> Vec<String> {
-    engine
-        .query(sql)
-        .unwrap_or_else(|error| panic!("query failed: {error}\n{sql}"))
-        .rows
-        .into_iter()
-        .map(|row| row[0].clone())
-        .collect()
-}
-
-/// Force the generic executor with a constant conjunct the fast path rejects.
 fn force_generic(sql: &str) -> String {
     let position = sql.find(" ORDER BY").unwrap_or(sql.len());
     let (head, tail) = sql.split_at(position);
