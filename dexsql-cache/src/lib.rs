@@ -11,7 +11,6 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use dexsql_mutf8::decode as decode_mutf8;
 use memmap2::MmapOptions;
 use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
@@ -19,9 +18,11 @@ use sha2::{Digest, Sha256};
 pub mod annotations;
 pub mod decode;
 pub mod metadata;
+mod string_pool;
 
 pub use metadata::MetaQuery;
 use metadata::MetadataIndexes;
+pub use string_pool::StringPool;
 
 #[derive(Debug, Clone)]
 pub struct LoadError(pub String);
@@ -251,7 +252,7 @@ pub struct DexFile {
     pub class_defs_off: u32,
     pub data_size: u32,
     pub data_off: u32,
-    pub strings: Vec<String>,
+    pub strings: StringPool,
     pub string_lookup: HashMap<String, u32>,
     pub types: Vec<TypeInfo>,
     pub protos: Vec<ProtoInfo>,
@@ -264,7 +265,7 @@ pub struct DexFile {
     pub methods_by_param_count: FxHashMap<u32, Vec<u32>>,
     pub methods_by_class: FxHashMap<u32, Vec<u32>>,
     pub methods_by_return: FxHashMap<u32, Vec<u32>>,
-    pub fields_by_name: FxHashMap<u32, Vec<u32>>,
+    pub fields_by_name: Arc<OnceLock<FxHashMap<u32, Vec<u32>>>>,
     /// Precomputed canonical descriptors used by query scans. Building these once
     /// avoids formatting a descriptor for every row of every repeated query.
     pub method_descriptors: Arc<OnceLock<Vec<String>>>,
@@ -286,14 +287,18 @@ pub struct DexFile {
     /// Indices into `classes` ordered by ascending `class_idx`; the
     /// class-data relations report rows in this order (not class_def order).
     pub classes_by_idx_order: Vec<u32>,
-    pub classes_by_superclass: FxHashMap<u32, Vec<u32>>,
-    pub classes_by_descriptor: FxHashMap<u32, Vec<u32>>,
+    pub classes_by_superclass: Arc<OnceLock<FxHashMap<u32, Vec<u32>>>>,
+    pub classes_by_descriptor: Arc<OnceLock<FxHashMap<u32, Vec<u32>>>>,
     /// Eager code items indexed by method id. Empty for lazy/index-only
     /// loads; absence of eager code must be resolved through
     /// [`DexFile::decode_code_item`] when raw bytes were retained.
     pub code_items: Vec<Option<CodeItem>>,
     pub method_strings: Vec<MethodStringRef>,
-    pub method_strings_by_string: FxHashMap<u32, Vec<u32>>,
+    /// Aggregate const-string edge count for a count-only load. This avoids
+    /// materializing one MethodStringRef per edge when the SQL result cannot
+    /// observe the edge payload.
+    pub method_string_count: u64,
+    pub method_strings_by_string: Arc<OnceLock<FxHashMap<u32, Vec<u32>>>>,
     pub method_numbers: Vec<MethodNumberRef>,
     pub method_numbers_by_value: HashMap<i64, Vec<u32>>,
     pub method_number_rows_by_value: FxHashMap<i64, Vec<usize>>,
@@ -305,6 +310,56 @@ pub struct DexFile {
 }
 
 impl DexFile {
+    pub fn field_name_index(&self) -> &FxHashMap<u32, Vec<u32>> {
+        self.fields_by_name.get_or_init(|| {
+            let mut index = FxHashMap::<u32, Vec<u32>>::default();
+            for (ordinal, field) in self.fields.iter().enumerate() {
+                index
+                    .entry(field.name_idx)
+                    .or_default()
+                    .push(ordinal as u32);
+            }
+            index
+        })
+    }
+    pub fn class_descriptor_index(&self) -> &FxHashMap<u32, Vec<u32>> {
+        self.classes_by_descriptor.get_or_init(|| {
+            let mut index = FxHashMap::<u32, Vec<u32>>::default();
+            for (ordinal, class) in self.classes.iter().enumerate() {
+                index
+                    .entry(class.class_idx)
+                    .or_default()
+                    .push(ordinal as u32);
+            }
+            index
+        })
+    }
+    pub fn class_superclass_index(&self) -> &FxHashMap<u32, Vec<u32>> {
+        self.classes_by_superclass.get_or_init(|| {
+            let mut index = FxHashMap::<u32, Vec<u32>>::default();
+            for (ordinal, class) in self.classes.iter().enumerate() {
+                if let Some(superclass) = class.superclass_idx {
+                    index.entry(superclass).or_default().push(ordinal as u32);
+                }
+            }
+            index
+        })
+    }
+    /// Literal string matchers need this reverse index; scans, joins and
+    /// grouped aggregates do not. Build it only when an accessor requests it
+    /// instead of retaining a hash bucket/vector for every referenced string.
+    pub fn string_reference_index(&self) -> &FxHashMap<u32, Vec<u32>> {
+        self.method_strings_by_string.get_or_init(|| {
+            let mut index = FxHashMap::<u32, Vec<u32>>::default();
+            for row in &self.method_strings {
+                index
+                    .entry(row.string_idx)
+                    .or_default()
+                    .push(row.method_idx);
+            }
+            index
+        })
+    }
     /// Raw DEX bytes; empty after a parse-only load dropped the payload.
     pub fn raw(&self) -> &[u8] {
         self.bytes.as_deref().map(|b| b.as_slice()).unwrap_or(&[])
@@ -339,8 +394,9 @@ impl DexFile {
             // inputs that violate the spec.
             let sorted = self
                 .strings
-                .windows(2)
-                .all(|pair| utf16_cmp(&pair[0], &pair[1]) != std::cmp::Ordering::Greater);
+                .iter()
+                .zip(self.strings.iter().skip(1))
+                .all(|(left, right)| utf16_cmp(left, right) != std::cmp::Ordering::Greater);
             if sorted {
                 return (0..self.strings.len() as u32).collect();
             }
@@ -390,10 +446,7 @@ impl DexFile {
     }
 
     pub fn string(&self, idx: u32) -> &str {
-        self.strings
-            .get(idx as usize)
-            .map(String::as_str)
-            .unwrap_or("")
+        self.strings.get(idx as usize).unwrap_or("")
     }
 
     /// Resolve a string-pool value without allocating a second `String` for
@@ -402,7 +455,7 @@ impl DexFile {
     /// whose UTF-16 ordering differs from Rust scalar ordering.
     pub fn find_string_idx(&self, value: &str) -> Option<u32> {
         self.strings
-            .binary_search_by(|item| item.as_str().cmp(value))
+            .binary_search_by(|item| item.cmp(value))
             .ok()
             .map(|idx| idx as u32)
             .or_else(|| {
@@ -1474,6 +1527,18 @@ pub struct IndexNeeds {
     pub method_calls: bool,
     pub method_field_accesses: bool,
     pub method_used_types: bool,
+    /// Count-only method_strings joins do not need to retain edge rows or
+    /// decode the string/type pools. The loader still scans code items, but
+    /// keeps only the aggregate cardinality on each DexFile.
+    pub method_string_count_only: bool,
+    /// Method-string edge queries that never inspect `value` or descriptor
+    /// columns can omit the decoded string/type/proto pools.
+    pub method_strings_no_pools: bool,
+    /// AST-proven metadata-only loads can retain class definitions without
+    /// materializing their encoded member vectors.
+    pub omit_class_members: bool,
+    /// No submitted statement can observe decoded string/type/proto pools.
+    pub omit_metadata_pools: bool,
 }
 
 /// Configure the shared Rayon pool before any archive work starts.  The CLI's
@@ -1497,6 +1562,10 @@ impl IndexNeeds {
             method_calls: true,
             method_field_accesses: true,
             method_used_types: true,
+            method_string_count_only: false,
+            method_strings_no_pools: false,
+            omit_class_members: false,
+            omit_metadata_pools: false,
         }
     }
 
@@ -1506,6 +1575,7 @@ impl IndexNeeds {
             || self.method_calls
             || self.method_field_accesses
             || self.method_used_types
+            || self.method_string_count_only
     }
 }
 
@@ -2088,7 +2158,7 @@ impl Dataset {
             class_defs_off: 0,
             data_size: 0,
             data_off: 0,
-            strings: Vec::new(),
+            strings: StringPool::new(),
             string_lookup: HashMap::new(),
             types: Vec::new(),
             protos: Vec::new(),
@@ -2099,7 +2169,7 @@ impl Dataset {
             methods_by_param_count: FxHashMap::default(),
             methods_by_class: FxHashMap::default(),
             methods_by_return: FxHashMap::default(),
-            fields_by_name: FxHashMap::default(),
+            fields_by_name: Arc::new(OnceLock::new()),
             method_descriptors: Arc::new(OnceLock::new()),
             field_descriptors: Arc::new(OnceLock::new()),
             debug_rows_cache: Arc::new(OnceLock::new()),
@@ -2108,11 +2178,12 @@ impl Dataset {
             method_descriptor_order: Arc::new(OnceLock::new()),
             string_utf16_ranks: Arc::new(OnceLock::new()),
             classes_by_idx_order: Vec::new(),
-            classes_by_superclass: FxHashMap::default(),
-            classes_by_descriptor: FxHashMap::default(),
+            classes_by_superclass: Arc::new(OnceLock::new()),
+            classes_by_descriptor: Arc::new(OnceLock::new()),
             code_items: Vec::new(),
             method_strings: Vec::new(),
-            method_strings_by_string: FxHashMap::default(),
+            method_string_count: 0,
+            method_strings_by_string: Arc::new(OnceLock::new()),
             method_numbers,
             method_numbers_by_value,
             method_number_rows_by_value,
@@ -2262,7 +2333,7 @@ impl Dataset {
             class_defs_off: 0,
             data_size: 0,
             data_off: 0,
-            strings: Vec::new(),
+            strings: StringPool::new(),
             string_lookup: HashMap::new(),
             types: Vec::new(),
             protos: Vec::new(),
@@ -2273,7 +2344,7 @@ impl Dataset {
             methods_by_param_count: FxHashMap::default(),
             methods_by_class: FxHashMap::default(),
             methods_by_return: FxHashMap::default(),
-            fields_by_name: FxHashMap::default(),
+            fields_by_name: Arc::new(OnceLock::new()),
             method_descriptors: Arc::new(OnceLock::new()),
             field_descriptors: Arc::new(OnceLock::new()),
             debug_rows_cache: Arc::new(OnceLock::new()),
@@ -2282,11 +2353,12 @@ impl Dataset {
             method_descriptor_order: Arc::new(OnceLock::new()),
             string_utf16_ranks: Arc::new(OnceLock::new()),
             classes_by_idx_order: Vec::new(),
-            classes_by_superclass: FxHashMap::default(),
-            classes_by_descriptor: FxHashMap::default(),
+            classes_by_superclass: Arc::new(OnceLock::new()),
+            classes_by_descriptor: Arc::new(OnceLock::new()),
             code_items: Vec::new(),
             method_strings,
-            method_strings_by_string: FxHashMap::default(),
+            method_string_count: 0,
+            method_strings_by_string: Arc::new(OnceLock::new()),
             method_numbers: Vec::new(),
             method_numbers_by_value: HashMap::new(),
             method_number_rows_by_value: FxHashMap::default(),
@@ -4300,52 +4372,70 @@ fn parse_dex(
     checked_range(&bytes, data_off, data_size, 1)
         .map_err(|e| LoadError(format!("invalid data section: {e}")))?;
 
-    let mut strings = Vec::with_capacity(string_count as usize);
-    for i in 0..string_count {
-        let off = read32(string_ids_off as usize + i as usize * 4)? as usize;
-        let (utf16_len, mut pos) = read_uleb(&bytes, off)?;
-        let start = pos;
-        while pos < bytes.len() && bytes[pos] != 0 {
-            pos += 1;
+    // A count-only method_strings join observes neither pool values nor
+    // method descriptors. Skipping their decode removes a large amount of
+    // allocation and UTF-8 work while preserving the code-offset scan below.
+    let skip_method_string_pools = index_needs.method_string_count_only
+        || index_needs.method_strings_no_pools
+        || index_needs.omit_metadata_pools;
+    let mut strings = StringPool::with_capacity(if skip_method_string_pools {
+        0
+    } else {
+        string_count as usize
+    });
+    if !skip_method_string_pools {
+        for i in 0..string_count {
+            let off = read32(string_ids_off as usize + i as usize * 4)? as usize;
+            let (utf16_len, pos) = read_uleb(&bytes, off)?;
+            let start = pos;
+            let pos = start
+                + memchr::memchr(0, &bytes[start..])
+                    .ok_or_else(|| LoadError(format!("unterminated DEX string {i}")))?;
+            strings.push_mutf8(&bytes[start..pos]).map_err(|e| {
+                LoadError(format!(
+                    "invalid DEX string {i} (utf16_len={utf16_len}): {e}"
+                ))
+            })?;
         }
-        if pos >= bytes.len() {
-            return Err(LoadError(format!("unterminated DEX string {i}")));
-        }
-        let decoded = decode_mutf8(&bytes[start..pos]).map_err(|e| {
-            LoadError(format!(
-                "invalid DEX string {i} (utf16_len={utf16_len}): {e}"
-            ))
-        })?;
-        strings.push(decoded);
     }
-    let types = (0..type_count)
-        .map(|i| {
-            Ok(TypeInfo {
-                descriptor_idx: read32(type_ids_off as usize + i as usize * 4)?,
+    let types = if skip_method_string_pools {
+        Vec::new()
+    } else {
+        (0..type_count)
+            .map(|i| {
+                Ok(TypeInfo {
+                    descriptor_idx: read32(type_ids_off as usize + i as usize * 4)?,
+                })
             })
-        })
-        .collect::<Result<Vec<_>, LoadError>>()?;
-    let mut protos = Vec::with_capacity(proto_count as usize);
-    for i in 0..proto_count {
-        let off = proto_ids_off as usize + i as usize * 12;
-        let shorty_idx = read32(off)?;
-        let return_type_idx = read32(off + 4)?;
-        let params_off = read32(off + 8)?; // proto_id layout: shorty, return_type, parameters
-        let parameters = if params_off == 0 {
-            Vec::new()
-        } else {
-            let size = read32(params_off as usize)? as usize;
-            let mut values = Vec::with_capacity(size);
-            for j in 0..size {
-                values.push(read_u16(&bytes, params_off as usize + 4 + j * 2)?);
-            }
-            values
-        };
-        protos.push(ProtoInfo {
-            shorty_idx,
-            return_type_idx,
-            parameters,
-        });
+            .collect::<Result<Vec<_>, LoadError>>()?
+    };
+    let mut protos = Vec::with_capacity(if skip_method_string_pools {
+        0
+    } else {
+        proto_count as usize
+    });
+    if !skip_method_string_pools {
+        for i in 0..proto_count {
+            let off = proto_ids_off as usize + i as usize * 12;
+            let shorty_idx = read32(off)?;
+            let return_type_idx = read32(off + 4)?;
+            let params_off = read32(off + 8)?; // proto_id layout: shorty, return_type, parameters
+            let parameters = if params_off == 0 {
+                Vec::new()
+            } else {
+                let size = read32(params_off as usize)? as usize;
+                let mut values = Vec::with_capacity(size);
+                for j in 0..size {
+                    values.push(read_u16(&bytes, params_off as usize + 4 + j * 2)?);
+                }
+                values
+            };
+            protos.push(ProtoInfo {
+                shorty_idx,
+                return_type_idx,
+                parameters,
+            });
+        }
     }
     let fields = if retain_classes {
         (0..field_count)
@@ -4428,23 +4518,27 @@ fn parse_dex(
         };
         let class_data_off = read32_arc(&bytes, off + 24)?;
         if !retain_classes {
-            if class_data_off != 0 {
+            if class_data_off != 0 && (eager_code_items || index_needs.any()) {
                 collect_code_offsets(&bytes, class_data_off as usize, &mut code_offsets)?;
             }
             continue;
         }
-        let (fields_defined, methods_defined) = if class_data_off == 0 {
-            (Vec::new(), Vec::new())
-        } else {
-            parse_class_data(
-                &bytes,
-                class_data_off as usize,
-                &mut code_items,
-                &mut code_offsets,
-                eager_code_items,
-                full_code_items,
-            )?
-        };
+        let (fields_defined, methods_defined) =
+            if class_data_off == 0 || index_needs.omit_class_members {
+                if class_data_off != 0 && (eager_code_items || index_needs.any()) {
+                    collect_code_offsets(&bytes, class_data_off as usize, &mut code_offsets)?;
+                }
+                (Vec::new(), Vec::new())
+            } else {
+                parse_class_data(
+                    &bytes,
+                    class_data_off as usize,
+                    &mut code_items,
+                    &mut code_offsets,
+                    eager_code_items,
+                    full_code_items,
+                )?
+            };
         let interfaces = if interfaces_off == 0 {
             Vec::new()
         } else {
@@ -4502,7 +4596,7 @@ fn parse_dex(
         methods_by_param_count,
         methods_by_class,
         methods_by_return,
-        fields_by_name: FxHashMap::default(),
+        fields_by_name: Arc::new(OnceLock::new()),
         method_descriptors: Arc::new(OnceLock::new()),
         field_descriptors: Arc::new(OnceLock::new()),
         debug_rows_cache: Arc::new(OnceLock::new()),
@@ -4517,15 +4611,16 @@ fn parse_dex(
             order
         },
         classes,
-        classes_by_superclass: FxHashMap::default(),
-        classes_by_descriptor: FxHashMap::default(),
+        classes_by_superclass: Arc::new(OnceLock::new()),
+        classes_by_descriptor: Arc::new(OnceLock::new()),
         code_items,
         method_strings: Vec::with_capacity(if index_needs.method_strings {
             method_count as usize / 4
         } else {
             0
         }),
-        method_strings_by_string: FxHashMap::default(),
+        method_string_count: 0,
+        method_strings_by_string: Arc::new(OnceLock::new()),
         method_numbers: Vec::with_capacity(if index_needs.method_numbers {
             method_count as usize / 2
         } else {
@@ -4538,20 +4633,11 @@ fn parse_dex(
         method_used_types: Vec::new(),
         meta: MetadataIndexes::default(),
     };
-    rebuild_nonmethod_lookup_indexes(&mut dex);
     if index_needs.any() {
         if eager_code_items && !full_code_items {
             derive_code_indexes_from_offsets(&mut dex, &code_offsets, index_needs)?;
         } else {
             derive_code_indexes(&mut dex, index_needs);
-        }
-        if index_needs.method_strings {
-            for row in &dex.method_strings {
-                dex.method_strings_by_string
-                    .entry(row.string_idx)
-                    .or_default()
-                    .push(row.method_idx);
-            }
         }
         if index_needs.method_numbers {
             for (row_idx, row) in dex.method_numbers.iter().enumerate() {
@@ -4621,27 +4707,6 @@ fn rebuild_method_lookup_indexes(dex: &mut DexFile) {
                 .or_default()
                 .push(method_idx as u32);
         }
-    }
-}
-
-fn rebuild_nonmethod_lookup_indexes(dex: &mut DexFile) {
-    for (field_idx, field) in dex.fields.iter().enumerate() {
-        dex.fields_by_name
-            .entry(field.name_idx)
-            .or_default()
-            .push(field_idx as u32);
-    }
-    for (class_idx, class) in dex.classes.iter().enumerate() {
-        if let Some(superclass_idx) = class.superclass_idx {
-            dex.classes_by_superclass
-                .entry(superclass_idx)
-                .or_default()
-                .push(class_idx as u32);
-        }
-        dex.classes_by_descriptor
-            .entry(class.class_idx)
-            .or_default()
-            .push(class_idx as u32);
     }
 }
 
@@ -5045,6 +5110,23 @@ fn derive_code_indexes_from_offsets(
     offsets: &[(u32, u32)],
     needs: IndexNeeds,
 ) -> Result<(), LoadError> {
+    if needs.method_string_count_only {
+        for &(method_idx, code_off) in offsets {
+            let off = code_off as usize;
+            let raw = dex.raw();
+            let insns_size = read_u32(raw, off + 12)? as usize;
+            let start = off + 16;
+            checked_range(raw, start as u32, insns_size as u32, 2).map_err(LoadError)?;
+            let insns: &[u16] = unsafe {
+                std::slice::from_raw_parts(raw.as_ptr().add(start) as *const u16, insns_size)
+            };
+            dex.method_string_count = dex
+                .method_string_count
+                .saturating_add(count_method_strings_instructions(insns));
+            let _ = method_idx;
+        }
+        return Ok(());
+    }
     for &(method_idx, code_off) in offsets {
         let off = code_off as usize;
         let raw = dex.raw();
@@ -5062,6 +5144,22 @@ fn derive_code_indexes_from_offsets(
     }
     finish_method_number_values(dex);
     Ok(())
+}
+
+#[inline]
+fn count_method_strings_instructions(insns: &[u16]) -> u64 {
+    let mut pc = 0usize;
+    let mut count = 0u64;
+    while pc < insns.len() {
+        let unit = insns[pc];
+        match (unit & 0xff) as u8 {
+            0x1a if pc + 1 < insns.len() => count = count.saturating_add(1),
+            0x1b if pc + 2 < insns.len() => count = count.saturating_add(1),
+            _ => {}
+        }
+        pc = pc.saturating_add(opcode_width((unit & 0xff) as u8, insns, pc).max(1));
+    }
+    count
 }
 
 #[inline(always)]

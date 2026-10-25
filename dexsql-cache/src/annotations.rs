@@ -296,7 +296,7 @@ fn encoded_value_json(file: &DexFile, cursor: &mut Cursor<'_>) -> Result<Value, 
             let index = cursor.read_unsigned_le(value_arg as usize + 1)? as usize;
             file.strings
                 .get(index)
-                .map(|value| Value::from(value.clone()))
+                .map(Value::from)
                 .ok_or_else(|| format!("annotation string index {index} is out of range"))
         }
         0x18 => {

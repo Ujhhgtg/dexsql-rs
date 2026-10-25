@@ -6,12 +6,13 @@ use sqlparser::ast::{
 };
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub(super) const HASH_THRESHOLD: usize = 16;
 const FUNCTION_NAME: &str = "\0dexsql_membership";
 const SEMIJOIN_NAME: &str = "\0dexsql_semijoin";
+const LOOKUP_NAME: &str = "\0dexsql_subquery_lookup";
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(super) enum Key {
@@ -21,6 +22,85 @@ pub(super) enum Key {
     Text(Arc<str>),
     Blob(Vec<u8>),
     InvalidReal(String),
+}
+
+/// Correlation keys are overwhelmingly one or two scalar columns. Keeping
+/// those inline avoids allocating a temporary Vec for every scanned/probed
+/// row; Many remains available for arbitrary composite keys.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub(super) enum KeyTuple {
+    Empty,
+    One(Key),
+    Two(Key, Key),
+    Many(Vec<Key>),
+}
+impl KeyTuple {
+    pub(super) fn from_options<I>(mut values: I) -> Option<Self>
+    where
+        I: Iterator<Item = Option<Key>>,
+    {
+        let Some(first) = values.next() else {
+            return Some(Self::Empty);
+        };
+        let first = first?;
+        let Some(second) = values.next() else {
+            return Some(Self::One(first));
+        };
+        let second = second?;
+        let rest = values.collect::<Option<Vec<_>>>()?;
+        if rest.is_empty() {
+            Some(Self::Two(first, second))
+        } else {
+            let mut all = Vec::with_capacity(rest.len() + 2);
+            all.push(first);
+            all.push(second);
+            all.extend(rest);
+            Some(Self::Many(all))
+        }
+    }
+    pub(super) fn from_results<I>(mut values: I) -> Result<Option<Self>, String>
+    where
+        I: Iterator<Item = Result<Option<Key>, String>>,
+    {
+        let Some(first) = values.next() else {
+            return Ok(Some(Self::Empty));
+        };
+        let Some(first) = first? else {
+            return Ok(None);
+        };
+        let Some(second) = values.next() else {
+            return Ok(Some(Self::One(first)));
+        };
+        let Some(second) = second? else {
+            return Ok(None);
+        };
+        let mut rest = Vec::new();
+        for value in values {
+            let Some(value) = value? else {
+                return Ok(None);
+            };
+            rest.push(value);
+        }
+        if rest.is_empty() {
+            Ok(Some(Self::Two(first, second)))
+        } else {
+            let mut all = Vec::with_capacity(rest.len() + 2);
+            all.push(first);
+            all.push(second);
+            all.extend(rest);
+            Ok(Some(Self::Many(all)))
+        }
+    }
+    pub(super) fn retained_bytes(&self) -> u64 {
+        let text_bytes = |key: &Key| key_bytes(key) - std::mem::size_of::<Key>() as u64;
+        std::mem::size_of::<Self>() as u64
+            + match self {
+                Self::Empty => 0,
+                Self::One(key) => text_bytes(key),
+                Self::Two(left, right) => text_bytes(left) + text_bytes(right),
+                Self::Many(keys) => keys.iter().map(key_bytes).sum::<u64>(),
+            }
+    }
 }
 
 /// NULL and NaN never match a non-NULL equality operand. Integral REALs share
@@ -126,40 +206,100 @@ pub(super) fn result(
     Scalar::Int((found != negated) as i64)
 }
 
-struct Compiled {
+/// Distinct membership values retain neither projected rows nor duplicate cells.
+/// The empty bit is separate from NULL membership for SQL's empty-set rules.
+pub(super) struct Values {
     keys: HashSet<Key>,
     saw_null: bool,
-    negated: bool,
     empty: bool,
 }
-impl Compiled {
-    fn new(values: Vec<Scalar>, negated: bool) -> Self {
-        let empty = values.is_empty();
-        let saw_null = values.iter().any(|value| matches!(value, Scalar::Null));
+impl Default for Values {
+    fn default() -> Self {
         Self {
-            keys: values.iter().filter_map(key).collect(),
-            saw_null,
-            negated,
-            empty,
+            keys: HashSet::new(),
+            saw_null: false,
+            empty: true,
         }
     }
-    fn evaluate(&self, value: &Scalar) -> Scalar {
+}
+impl Values {
+    /// Return additional retained bytes, for the query's materialization bound.
+    pub(super) fn insert(&mut self, value: Scalar) -> u64 {
+        self.empty = false;
+        if matches!(value, Scalar::Null) {
+            self.saw_null = true;
+            return 0;
+        }
+        let Some(key) = key(&value) else {
+            return 0;
+        };
+        let bytes = key_bytes(&key) + 32;
+        if self.keys.insert(key) {
+            bytes
+        } else {
+            0
+        }
+    }
+    fn evaluate(&self, value: &Scalar, negated: bool) -> Scalar {
         let found = key(value).is_some_and(|key| self.keys.contains(&key));
-        result(found, self.saw_null, self.empty, value, self.negated)
+        result(found, self.saw_null, self.empty, value, negated)
     }
 }
 
+pub(super) fn key_bytes(key: &Key) -> u64 {
+    std::mem::size_of::<Key>() as u64
+        + match key {
+            Key::Text(value) => value.len() as u64,
+            Key::Blob(value) => value.len() as u64,
+            Key::InvalidReal(value) => value.len() as u64,
+            _ => 0,
+        }
+}
+
+struct Compiled {
+    values: Values,
+    negated: bool,
+}
+impl Compiled {
+    fn new(values: Vec<Scalar>, negated: bool) -> Self {
+        let mut compiled = Self {
+            values: Values::default(),
+            negated,
+        };
+        for value in values {
+            compiled.values.insert(value);
+        }
+        compiled
+    }
+    fn evaluate(&self, value: &Scalar) -> Scalar {
+        self.values.evaluate(value, self.negated)
+    }
+}
+
+/// A correlation key chooses a small membership set or scalar aggregate.
+/// One lookup replaces every outer-row execution of the inner query.
+enum Lookup {
+    Membership {
+        groups: HashMap<KeyTuple, Values>,
+        negated: bool,
+    },
+    Scalar {
+        groups: HashMap<KeyTuple, Scalar>,
+        default: Scalar,
+    },
+}
 struct Semijoin {
-    keys: HashSet<Vec<Key>>,
+    keys: HashSet<KeyTuple>,
     negated: bool,
 }
 
 thread_local! {
     static COMPILED: RefCell<Vec<Compiled>> = const { RefCell::new(Vec::new()) };
     static SEMIJOINS: RefCell<Vec<Semijoin>> = const { RefCell::new(Vec::new()) };
+    static LOOKUPS: RefCell<Vec<Lookup>> = const { RefCell::new(Vec::new()) };
 }
 
-pub(super) fn register_rows(keys: HashSet<Vec<Key>>, negated: bool, values: Vec<Expr>) -> Expr {
+pub(super) fn register_rows(keys: HashSet<KeyTuple>, negated: bool, values: Vec<Expr>) -> Expr {
     let index = SEMIJOINS.with(|sets| {
         let mut sets = sets.borrow_mut();
         let index = sets.len();
@@ -190,20 +330,72 @@ pub(super) fn register_rows(keys: HashSet<Vec<Key>>, negated: bool, values: Vec<
     })
 }
 
+pub(super) fn register_membership(
+    groups: HashMap<KeyTuple, Values>,
+    negated: bool,
+    keys: Vec<Expr>,
+    value: Expr,
+) -> Expr {
+    let mut args = vec![value];
+    args.extend(keys);
+    register_lookup(Lookup::Membership { groups, negated }, args)
+}
+
+pub(super) fn register_scalars(
+    groups: HashMap<KeyTuple, Scalar>,
+    default: Scalar,
+    keys: Vec<Expr>,
+) -> Expr {
+    register_lookup(Lookup::Scalar { groups, default }, keys)
+}
+
+fn register_lookup(lookup: Lookup, values: Vec<Expr>) -> Expr {
+    let index = LOOKUPS.with(|lookups| {
+        let mut lookups = lookups.borrow_mut();
+        let index = lookups.len();
+        lookups.push(lookup);
+        index
+    });
+    let mut args = vec![super::scalar_literal(Scalar::Int(index as i64))];
+    args.extend(values);
+    Expr::Function(Function {
+        name: ObjectName::from(vec![Ident::new(LOOKUP_NAME)]),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: args
+                .into_iter()
+                .map(|expr| FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)))
+                .collect(),
+            clauses: Vec::new(),
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: Vec::new(),
+    })
+}
+
 /// Nested query execution may register its own lists; truncate only entries
 /// owned by this sink, on success, fallback, error, or unwind.
 pub(super) struct Scope {
     start: usize,
     semijoins_start: usize,
+    lookups_start: usize,
 }
 impl Scope {
     pub(super) fn new() -> Self {
         Self {
             start: COMPILED.with(|sets| sets.borrow().len()),
             semijoins_start: SEMIJOINS.with(|sets| sets.borrow().len()),
+            lookups_start: LOOKUPS.with(|sets| sets.borrow().len()),
         }
     }
     pub(super) fn compile(&self, expr: &mut Expr) {
+        Self::compile_current(expr);
+    }
+    pub(super) fn compile_current(expr: &mut Expr) {
         let Expr::InList {
             expr: value,
             list,
@@ -250,6 +442,7 @@ impl Drop for Scope {
     fn drop(&mut self) {
         COMPILED.with(|sets| sets.borrow_mut().truncate(self.start));
         SEMIJOINS.with(|sets| sets.borrow_mut().truncate(self.semijoins_start));
+        LOOKUPS.with(|sets| sets.borrow_mut().truncate(self.lookups_start));
     }
 }
 
@@ -283,7 +476,7 @@ pub(super) fn evaluate(
         return None;
     }
     let name = &function.name.0[0].as_ident()?.value;
-    if name != FUNCTION_NAME && name != SEMIJOIN_NAME {
+    if name != FUNCTION_NAME && name != SEMIJOIN_NAME && name != LOOKUP_NAME {
         return None;
     }
     Some((|| {
@@ -301,16 +494,66 @@ pub(super) fn evaluate(
         let index = index
             .parse::<usize>()
             .map_err(|_| "invalid compiled membership id")?;
-        if name == SEMIJOIN_NAME {
-            let values = args.args[1..]
-                .iter()
-                .map(|arg| {
+        if name == LOOKUP_NAME {
+            let membership_lookup = LOOKUPS
+                .with(|lookups| {
+                    lookups
+                        .borrow()
+                        .get(index)
+                        .map(|lookup| matches!(lookup, Lookup::Membership { .. }))
+                })
+                .ok_or("compiled subquery outside query scope")?;
+            let (value, key) = if membership_lookup {
+                let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(value_expr))) =
+                    args.args.get(1)
+                else {
+                    return Err("invalid subquery membership".to_owned());
+                };
+                let value = eval_scalar(value_expr, row, group)?;
+                let key = KeyTuple::from_results(args.args[2..].iter().map(|arg| {
                     let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = arg else {
-                        return Err("invalid semijoin key".to_owned());
+                        return Err("invalid subquery lookup argument".to_owned());
                     };
                     eval_scalar(expr, row, group).map(|value| key(&value))
-                })
-                .collect::<Result<Option<Vec<_>>, _>>()?;
+                }))?;
+                (Some(value), key)
+            } else {
+                let key = KeyTuple::from_results(args.args[1..].iter().map(|arg| {
+                    let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = arg else {
+                        return Err("invalid subquery lookup argument".to_owned());
+                    };
+                    eval_scalar(expr, row, group).map(|value| key(&value))
+                }))?;
+                (None, key)
+            };
+            return LOOKUPS.with(|lookups| {
+                let lookups = lookups.borrow();
+                let lookup = lookups
+                    .get(index)
+                    .ok_or("compiled subquery outside query scope")?;
+                match lookup {
+                    Lookup::Membership { groups, negated } => {
+                        let value = value.ok_or("invalid subquery membership")?;
+                        Ok(match key.as_ref().and_then(|key| groups.get(key)) {
+                            Some(values) => values.evaluate(&value, *negated),
+                            None => Scalar::Int(*negated as i64),
+                        })
+                    }
+                    Lookup::Scalar { groups, default } => Ok(key
+                        .as_ref()
+                        .and_then(|key| groups.get(key))
+                        .unwrap_or(default)
+                        .clone()),
+                }
+            });
+        }
+        if name == SEMIJOIN_NAME {
+            let values = KeyTuple::from_results(args.args[1..].iter().map(|arg| {
+                let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = arg else {
+                    return Err("invalid semijoin key".to_owned());
+                };
+                eval_scalar(expr, row, group).map(|value| key(&value))
+            }))?;
             return SEMIJOINS.with(|sets| {
                 let sets = sets.borrow();
                 let set = sets
@@ -359,6 +602,38 @@ mod tests {
     }
     fn real(value: &str) -> Scalar {
         Scalar::Real(value.to_owned())
+    }
+
+    #[test]
+    fn correlation_tuples_keep_small_keys_inline_and_large_keys_complete() {
+        for count in 0..8 {
+            let keys = (0..count)
+                .map(|value| Key::Int(value as i64))
+                .collect::<Vec<_>>();
+            let key = KeyTuple::from_options(keys.iter().cloned().map(Some)).unwrap();
+            let result = KeyTuple::from_results(keys.iter().cloned().map(|key| Ok(Some(key))))
+                .unwrap()
+                .unwrap();
+            assert_eq!(key, result);
+            assert!(match (count, &key) {
+                (0, KeyTuple::Empty) | (1, KeyTuple::One(_)) | (2, KeyTuple::Two(_, _)) => true,
+                (count, KeyTuple::Many(values)) => values.len() == count,
+                _ => false,
+            });
+            let mut set = HashSet::new();
+            set.insert(key);
+            assert!(set.contains(&result));
+        }
+        assert!(KeyTuple::from_options([Some(Key::Int(1)), None].into_iter()).is_none());
+        assert!(
+            KeyTuple::from_results([Ok(Some(Key::Int(1))), Ok(None)].into_iter())
+                .unwrap()
+                .is_none()
+        );
+        assert!(KeyTuple::from_results(
+            [Ok(Some(Key::Int(1))), Err("failure".to_owned())].into_iter()
+        )
+        .is_err());
     }
 
     #[test]
@@ -526,7 +801,7 @@ mod tests {
             COMPILED.with(|sets| {
                 let sets = sets.borrow();
                 assert_eq!(sets.len(), start + 1);
-                assert_eq!(sets[start].keys.len(), 4098);
+                assert_eq!(sets[start].values.keys.len(), 4098);
             });
             for value in [
                 Scalar::Int(-2),

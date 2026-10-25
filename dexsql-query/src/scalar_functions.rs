@@ -16,7 +16,7 @@ pub fn real_format(value: f64) -> String {
     if value.is_infinite() {
         return if value > 0.0 { "Inf" } else { "-Inf" }.to_owned();
     }
-    let mut text = format!("{value}");
+    let mut text = format!("{}", if value == 0.0 { 0.0 } else { value });
     if !text.contains('.') && !text.contains('e') && !text.contains('E') {
         text.push_str(".0");
     }

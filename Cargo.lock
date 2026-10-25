@@ -409,6 +409,7 @@ dependencies = [
  "crc32fast",
  "dexsql-inflate",
  "dexsql-mutf8",
+ "memchr",
  "memmap2",
  "rayon",
  "rustc-hash",

@@ -1077,7 +1077,7 @@ fn string_candidate_methods(file: &DexFile, need: &StringNeed) -> HashSet<u32> {
     let mut out = HashSet::new();
     if need.mode == LikeMode::Equal && !need.case_insensitive {
         if let Some(string_idx) = file.find_string_idx(&need.value) {
-            if let Some(methods) = file.method_strings_by_string.get(&string_idx) {
+            if let Some(methods) = file.string_reference_index().get(&string_idx) {
                 out.extend(methods.iter().copied());
             }
         }
@@ -1087,7 +1087,7 @@ fn string_candidate_methods(file: &DexFile, need: &StringNeed) -> HashSet<u32> {
         if !plain_like_match(value, need) {
             continue;
         }
-        if let Some(methods) = file.method_strings_by_string.get(&(string_idx as u32)) {
+        if let Some(methods) = file.string_reference_index().get(&(string_idx as u32)) {
             out.extend(methods.iter().copied());
         }
     }
@@ -2447,7 +2447,7 @@ fn run_class_lookup(
         for class_idx in classes {
             let descriptor = file.type_descriptor(class_idx);
             if !superunit_allowed.is_empty() {
-                let Some(defs) = file.classes_by_descriptor.get(&class_idx) else {
+                let Some(defs) = file.class_descriptor_index().get(&class_idx) else {
                     continue;
                 };
                 let satisfied = superunit_allowed.iter().all(|allowed| {
@@ -2490,7 +2490,7 @@ fn run_class_lookup(
                 || interface_count_min.is_some()
                 || interface_count_max.is_some()
             {
-                let Some(defs) = file.classes_by_descriptor.get(&class_idx) else {
+                let Some(defs) = file.class_descriptor_index().get(&class_idx) else {
                     continue;
                 };
                 let matched = defs.iter().any(|def_idx| {

@@ -643,7 +643,7 @@ impl DexFile {
 
     /// Class definition for a type id, if this file defines that class.
     pub fn class_for_type_idx(&self, type_idx: u32) -> Option<&ClassInfo> {
-        let class_index = *self.classes_by_descriptor.get(&type_idx)?.first()?;
+        let class_index = *self.class_descriptor_index().get(&type_idx)?.first()?;
         self.classes.get(class_index as usize)
     }
 
@@ -750,7 +750,7 @@ impl DexFile {
         parts: &FieldDescriptorParts<'_>,
     ) -> Option<u32> {
         let name_idx = self.find_string_idx(parts.name)?;
-        self.fields_by_name
+        self.field_name_index()
             .get(&name_idx)?
             .iter()
             .copied()

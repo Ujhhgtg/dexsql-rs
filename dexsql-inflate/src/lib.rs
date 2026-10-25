@@ -7,7 +7,6 @@
 //! member.
 
 use std::fs::File;
-use std::io::Read;
 use std::path::Path;
 
 use memmap2::Mmap;
@@ -79,6 +78,19 @@ where
         .map(|(index, entry)| {
             let name = entry.name.clone();
             let bytes = inflate_entry(&mmap, &entry)?;
+            // Input bytes have been copied/decoded into the owned output.
+            // Retaining every compressed page until the final DEX finishes
+            // needlessly adds the archive's DEX compressed size to peak RSS.
+            #[cfg(unix)]
+            unsafe {
+                // Read-only file mapping: discarding pages changes neither
+                // their contents nor any other worker's owned output.
+                let _ = mmap.unchecked_advise_range(
+                    memmap2::UncheckedAdvice::DontNeed,
+                    entry.compressed_offset,
+                    entry.compressed_size,
+                );
+            }
             parser(index, name, bytes)
         })
         .collect()
@@ -101,10 +113,21 @@ fn inflate_entry(mmap: &[u8], entry: &Entry) -> Result<Vec<u8>, InflateError> {
             // this mirrors the original anonymous mmap output buffers.
             let mut output = Vec::with_capacity(entry.uncompressed_size);
             unsafe { output.set_len(entry.uncompressed_size) };
-            let mut decoder = flate2::read::DeflateDecoder::new(input);
-            decoder
-                .read_exact(&mut output)
+            // The ZIP directory already supplies both buffer sizes. Give
+            // zlib the final output directly rather than going through the
+            // Read adapter's chunk loop and bookkeeping.
+            let mut decoder = flate2::Decompress::new(false);
+            let status = decoder
+                .decompress(input, &mut output, flate2::FlushDecompress::Finish)
                 .map_err(|e| InflateError(format!("failed to inflate {}: {e}", entry.name)))?;
+            if status != flate2::Status::StreamEnd
+                || decoder.total_out() != entry.uncompressed_size as u64
+            {
+                return Err(InflateError(format!(
+                    "truncated deflated ZIP entry {}",
+                    entry.name
+                )));
+            }
             output
         }
         method => {

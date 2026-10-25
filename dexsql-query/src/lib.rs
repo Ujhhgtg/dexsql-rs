@@ -30,12 +30,16 @@ pub struct QueryResult {
 }
 
 mod correlated;
+mod derived;
 mod error;
+mod expressions;
 mod fast_descriptor;
+mod load_plan;
 mod membership;
 #[cfg(test)]
 mod memory_plan_tests;
 mod param_pattern;
+mod physical_methods;
 mod relational;
 mod scalar_functions;
 mod streaming;
@@ -328,7 +332,7 @@ fn validate_definition_query(
             "expected exactly one SQL statement",
         ));
     }
-    let dialect = sqlparser::dialect::SQLiteDialect {};
+    let dialect = expressions::Dialect {};
     let parsed = sqlparser::parser::Parser::parse_sql(&dialect, &statements[0]).map_err(|e| {
         let (mapped, span) = dexsql_ast::parser::map_parser_error(&e.to_string(), &statements[0]);
         let rendered = match span {
@@ -521,15 +525,27 @@ fn query_load_options(sqls: &[String]) -> (IndexNeeds, bool, bool, bool, bool) {
     let mut retain_classes = false;
     let mut retain_raw_bytes = false;
     for sql in sqls {
+        let reduced_sql = sqlparser::parser::Parser::parse_sql(&expressions::Dialect {}, sql)
+            .ok()
+            .and_then(|statements| match statements.into_iter().next()? {
+                sqlparser::ast::Statement::Query(query) => derived::query(&query),
+                _ => None,
+            })
+            .map(|query| query.to_string());
+        let sql = reduced_sql.as_ref().unwrap_or(sql);
         // Method lookup indexes are needed only when a methods relation is
         // reachable. Keeping them out of class/field-only loads saves large
         // per-method Vec/hash allocations on multidex APKs.
-        if sql.to_ascii_lowercase().contains("methods") {
-            needs.method_lookup = true;
-        }
         // Loader requirements must tolerate line breaks and comments between
         // SELECT and its wildcard; they are not part of SQL semantics.
         let lower = sql.to_ascii_lowercase();
+        // The per-method name/class/return indexes are useful for descriptor
+        // matcher lookups, but regular joins and relation scans walk the
+        // dense method-id array directly. Avoid retaining four hash maps for
+        // every join query; this is a large resident-set cost on multidex APKs.
+        // Lookup maps are optional acceleration structures. CLI executions
+        // usually scan a relation once, so their construction and residency
+        // cost more than the scan. Embedded sessions may still request them.
         let method_wildcard = lower.contains("methods") && query_has_projection_wildcard(sql);
         // These relations still read offsets or lazily decode streams from
         // the original DEX. This lifetime is independent of eager code/try
@@ -609,6 +625,30 @@ fn query_load_options(sqls: &[String]) -> (IndexNeeds, bool, bool, bool, bool) {
             retain_classes = true;
         }
     }
+    // Pool/edge elision is a proof over the entire shared batch; an OR of
+    // per-statement text guesses can silently remove another query's source.
+    match physical_methods::pool_mode(sqls) {
+        physical_methods::PoolMode::CountOnly => {
+            needs.method_string_count_only = true;
+            needs.method_strings_no_pools = false;
+            needs.method_strings = false;
+        }
+        physical_methods::PoolMode::IdEdges => {
+            needs.method_string_count_only = false;
+            needs.method_strings_no_pools = true;
+            needs.method_strings = true;
+        }
+        physical_methods::PoolMode::Full => {
+            needs.method_string_count_only = false;
+            needs.method_strings_no_pools = false;
+        }
+    }
+    let metadata = load_plan::plan_batch(sqls);
+    needs.omit_class_members = metadata.omit_class_members;
+    needs.omit_metadata_pools = metadata.omit_pools;
+    // Reference indexes are derived from instruction streams. Requesting one
+    // therefore requires an offset-driven pass, while the parsed code bodies
+    // remain dropped after indexing when full code data is not requested.
     eager_code_items |= needs.any();
     retain_classes |= full_code_items || needs.method_field_accesses;
     (
@@ -660,7 +700,7 @@ fn query_has_projection_wildcard(sql: &str) -> bool {
     // text. Use tokens here so count(*) and '*' string literals do not make
     // otherwise metadata-only method queries retain their instruction data.
     use sqlparser::tokenizer::{Token, Tokenizer};
-    let dialect = sqlparser::dialect::SQLiteDialect {};
+    let dialect = expressions::Dialect {};
     let Ok(tokens) = Tokenizer::new(&dialect, sql).tokenize() else {
         return true;
     };
@@ -742,9 +782,7 @@ fn is_sql_identifier(name: &str) -> bool {
 }
 
 fn bare_count_query(sql: &str) -> bool {
-    let Ok(statements) =
-        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::SQLiteDialect {}, sql)
-    else {
+    let Ok(statements) = sqlparser::parser::Parser::parse_sql(&expressions::Dialect {}, sql) else {
         return false;
     };
     let Some(sqlparser::ast::Statement::Query(query)) = statements.first() else {
@@ -760,6 +798,11 @@ fn bare_count_query(sql: &str) -> bool {
 }
 
 fn fast_input_count(sql: &str, inputs: &[PathBuf], cli_limit: Option<u64>) -> Option<QueryResult> {
+    if sql.to_ascii_lowercase().contains(" join ")
+        || sql.to_ascii_lowercase().contains("method_strings")
+    {
+        return None;
+    }
     if !bare_count_query(sql) {
         return None;
     }
@@ -1014,7 +1057,7 @@ fn sql_table_names(sql: &str) -> Vec<String> {
     if statements.len() != 1 {
         return Vec::new();
     }
-    let dialect = sqlparser::dialect::SQLiteDialect {};
+    let dialect = expressions::Dialect {};
     let Ok(parsed) = sqlparser::parser::Parser::parse_sql(&dialect, &statements[0]) else {
         return Vec::new();
     };
@@ -1685,6 +1728,14 @@ fn indexed_method_candidates(
     file: &dexsql_cache::DexFile,
     predicates: &[PushPredicate],
 ) -> Option<Vec<u32>> {
+    if !file.methods.is_empty()
+        && file.methods_by_name.is_empty()
+        && file.methods_by_class.is_empty()
+        && file.methods_by_param_count.is_empty()
+        && file.methods_by_return.is_empty()
+    {
+        return None;
+    }
     let mut sets = Vec::<Vec<u32>>::new();
     for predicate in predicates {
         if !matches!(
@@ -1811,7 +1862,7 @@ fn indexed_field_candidates(
         let Some(string_idx) = file.find_string_idx(value) else {
             return Some(Vec::new());
         };
-        let Some(fields) = file.fields_by_name.get(&string_idx) else {
+        let Some(fields) = file.field_name_index().get(&string_idx) else {
             return Some(Vec::new());
         };
         candidates.extend(fields.iter().copied());
@@ -1851,9 +1902,9 @@ fn indexed_class_candidates(
             .map(|(idx, _)| idx as u32);
         for type_idx in type_indices {
             let classes = if predicate.column.eq_ignore_ascii_case("descriptor") {
-                file.classes_by_descriptor.get(&type_idx)
+                file.class_descriptor_index().get(&type_idx)
             } else {
-                file.classes_by_superclass.get(&type_idx)
+                file.class_superclass_index().get(&type_idx)
             };
             let Some(classes) = classes else {
                 continue;
@@ -1946,7 +1997,7 @@ fn validate_single(sql: &str) -> Result<dexsql_ast::Statement, DexSqlError> {
     if let dexsql_ast::Statement::Query { sql } = &statement {
         if let Ok(statements) = split_statements(sql) {
             if statements.len() == 1 {
-                let dialect = sqlparser::dialect::SQLiteDialect {};
+                let dialect = expressions::Dialect {};
                 match sqlparser::parser::Parser::parse_sql(&dialect, &statements[0]) {
                     Err(error) => {
                         let (mapped, span) = dexsql_ast::parser::map_parser_error(
@@ -2270,10 +2321,14 @@ impl Scalar {
     fn truthy(&self) -> bool {
         match self {
             Self::Null => false,
-            Self::Blob(bytes) => !bytes.is_empty(),
+            Self::Blob(_) => expressions::number(self)
+                .numeric()
+                .is_some_and(|value| value != 0.0),
             Self::Int(v) => *v != 0,
             Self::Real(v) => v.parse::<f64>().map(|n| n != 0.0).unwrap_or(false),
-            Self::Text(v) => !v.is_empty(),
+            Self::Text(_) => expressions::number(self)
+                .numeric()
+                .is_some_and(|value| value != 0.0),
         }
     }
 
@@ -2487,7 +2542,7 @@ pub fn execute_statement(
             return Ok(result);
         }
     }
-    let dialect = sqlparser::dialect::SQLiteDialect {};
+    let dialect = expressions::Dialect {};
     let statements = sqlparser::parser::Parser::parse_sql(&dialect, normalized)
         .map_err(|e| format!("SQL parse error: {e}"))?;
     if statements.len() != 1 {
@@ -2521,8 +2576,29 @@ pub fn execute_statement(
         }
     }
     if dataset.is_some() && query.with.is_none() {
+        if !cache_shadows_relation(normalized, named_caches)
+            && physical_methods::unshadowed(&query, named_caches)
+        {
+            if let Some(result) = fast_method_string_identity_ordered_limit(&query, ds, cli_limit) {
+                return result;
+            }
+            if let Some(result) = fast_derived_method_name_topk(&query, ds, cli_limit) {
+                return result;
+            }
+            if let Some(result) = fast_relation_join_count(&query, ds, cli_limit) {
+                return result;
+            }
+        }
         if let Some(result) = try_fast_count_scan(&query, ds, cli_limit) {
             return result;
+        }
+        if physical_methods::unshadowed(&query, named_caches) {
+            if let Some(result) = fast_methods_expression_topk(&query, ds, cli_limit) {
+                return result;
+            }
+            if let Some(result) = fast_methods_string_predicate_limit(&query, ds, cli_limit) {
+                return result;
+            }
         }
         if let Some(result) = fast_methods_topk(&query, ds, cli_limit) {
             return result;
@@ -2559,6 +2635,640 @@ pub fn execute_statement(
         cli_limit,
         needs_method_opcode,
     )
+}
+
+/// Stream a complete identity method↔method_strings join into a bounded
+/// top-k heap for the common ordered LIMIT shape. The proof is structural:
+/// there are exactly the two identity equalities, no residual predicates or
+/// grouping, and the projection/order keys are the joined key columns. This
+/// avoids sorting the entire edge relation or constructing relational rows.
+fn fast_method_string_identity_ordered_limit(
+    query: &sqlparser::ast::Query,
+    ds: &Dataset,
+    cli_limit: Option<u64>,
+) -> Option<Result<QueryResult, String>> {
+    let physical = physical_methods::identity_ordered_limit(query)?;
+    use sqlparser::ast::{Expr, JoinConstraint, JoinOperator, OrderByKind, SetExpr, TableFactor};
+    let select = match query.body.as_ref() {
+        SetExpr::Select(select) => select.as_ref(),
+        _ => return None,
+    };
+    if select.from.len() != 1
+        || select.from[0].joins.len() != 1
+        || select.selection.is_some()
+        || select.having.is_some()
+        || select.distinct.is_some()
+        || !matches!(&select.group_by, sqlparser::ast::GroupByExpr::Expressions(exprs, modifiers) if exprs.is_empty() && modifiers.is_empty())
+        || select.projection.len() != 3
+    {
+        return None;
+    }
+    let TableFactor::Table {
+        name: left_name,
+        alias: left_alias,
+        args: left_args,
+        ..
+    } = &select.from[0].relation
+    else {
+        return None;
+    };
+    let TableFactor::Table {
+        name: right_name,
+        alias: right_alias,
+        args: right_args,
+        ..
+    } = &select.from[0].joins[0].relation
+    else {
+        return None;
+    };
+    if left_args.is_some()
+        || right_args.is_some()
+        || left_name.0.len() != 1
+        || right_name.0.len() != 1
+    {
+        return None;
+    }
+    let left_table = left_name.0.last()?.as_ident()?.value.to_ascii_lowercase();
+    let right_table = right_name.0.last()?.as_ident()?.value.to_ascii_lowercase();
+    let left_alias = left_alias
+        .as_ref()
+        .map(|a| a.name.value.as_str())
+        .unwrap_or(&left_table);
+    let right_alias = right_alias
+        .as_ref()
+        .map(|a| a.name.value.as_str())
+        .unwrap_or(&right_table);
+    let (method_alias, string_alias) = if left_table == "methods" && right_table == "method_strings"
+    {
+        (left_alias, right_alias)
+    } else if left_table == "method_strings" && right_table == "methods" {
+        (right_alias, left_alias)
+    } else {
+        return None;
+    };
+    let (JoinOperator::Join(JoinConstraint::On(on)) | JoinOperator::Inner(JoinConstraint::On(on))) =
+        &select.from[0].joins[0].join_operator
+    else {
+        return None;
+    };
+    let mut conjuncts = Vec::new();
+    flatten_and(on, &mut conjuncts);
+    let mut pairs = HashSet::new();
+    for conjunct in conjuncts {
+        let Expr::BinaryOp {
+            left,
+            op: sqlparser::ast::BinaryOperator::Eq,
+            right,
+        } = conjunct
+        else {
+            return None;
+        };
+        let Some((la, lc)) = qualified_column(left) else {
+            return None;
+        };
+        let Some((ra, rc)) = qualified_column(right) else {
+            return None;
+        };
+        let pair = if la.eq_ignore_ascii_case(method_alias) && ra.eq_ignore_ascii_case(string_alias)
+        {
+            (lc.to_ascii_lowercase(), rc.to_ascii_lowercase())
+        } else if ra.eq_ignore_ascii_case(method_alias) && la.eq_ignore_ascii_case(string_alias) {
+            (rc.to_ascii_lowercase(), lc.to_ascii_lowercase())
+        } else {
+            return None;
+        };
+        pairs.insert(pair);
+    }
+    if pairs.len() != 2
+        || !pairs.contains(&(String::from("file_id"), String::from("file_id")))
+        || !pairs.contains(&(String::from("method_idx"), String::from("method_idx")))
+    {
+        return None;
+    }
+    let expected = [
+        (method_alias, "file_id"),
+        (method_alias, "method_idx"),
+        (string_alias, "string_idx"),
+    ];
+    for (item, (qualifier, column)) in select.projection.iter().zip(expected) {
+        let Some(expr) = item_expr(item) else {
+            return None;
+        };
+        if !is_column_expr(expr, column, Some(qualifier)) {
+            return None;
+        }
+    }
+    let OrderByKind::Expressions(order) = &query.order_by.as_ref()?.kind else {
+        return None;
+    };
+    if order.len() != 3 {
+        return None;
+    }
+    for (entry, (qualifier, column)) in order.iter().zip(expected) {
+        if entry.options.sort == Some(sqlparser::ast::OrderBySort::Desc)
+            || !is_column_expr(&entry.expr, column, Some(qualifier))
+        {
+            return None;
+        }
+    }
+    let limit = query_limit_value(query.limit_clause.as_ref())? as u64;
+    let offset = query_offset_value(query.limit_clause.as_ref()).unwrap_or(0) as u64;
+    let limit = cli_limit.map_or(limit, |cli| limit.min(cli));
+    let needed = offset.saturating_add(limit) as usize;
+    let mut heap = BinaryHeap::with_capacity(needed.saturating_add(1));
+    if needed > 0 {
+        for file in &ds.files {
+            for edge in &file.method_strings {
+                if (edge.method_idx as usize) >= file.methods.len() {
+                    continue;
+                }
+                let key = (file.file_id, edge.method_idx, edge.string_idx);
+                if heap.len() < needed {
+                    heap.push(key);
+                } else if heap.peek().is_some_and(|worst| key < *worst) {
+                    heap.pop();
+                    heap.push(key);
+                }
+            }
+        }
+    }
+    let rows = heap
+        .into_sorted_vec()
+        .into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .map(|(file_id, method_idx, string_idx)| {
+            vec![
+                file_id.to_string(),
+                method_idx.to_string(),
+                string_idx.to_string(),
+            ]
+        })
+        .collect();
+    Some(Ok(QueryResult {
+        columns: physical.columns,
+        rows,
+    }))
+}
+
+/// Bounded pull for a simple derived methods source. The inner wildcard is
+/// reduced to a method-index predicate, while the outer sink only asks for
+/// name length and the stable method identity. This avoids materializing and
+/// sorting every qualifying method row.
+fn fast_derived_method_name_topk(
+    query: &sqlparser::ast::Query,
+    ds: &Dataset,
+    cli_limit: Option<u64>,
+) -> Option<Result<QueryResult, String>> {
+    let physical = physical_methods::derived_name_topk(query)?;
+    use sqlparser::ast::{
+        BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, OrderByKind,
+        SelectItem, TableFactor, Value,
+    };
+    let select = query.body.as_ref().as_select()?;
+    if select.from.len() != 1
+        || !select.from[0].joins.is_empty()
+        || select.selection.is_some()
+        || select.having.is_some()
+        || select.distinct.is_some()
+        || select.projection.len() != 3
+        || !matches!(&select.group_by, sqlparser::ast::GroupByExpr::Expressions(exprs, modifiers) if exprs.is_empty() && modifiers.is_empty())
+    {
+        return None;
+    }
+    let TableFactor::Derived {
+        subquery,
+        alias: Some(outer_alias),
+        lateral: false,
+        ..
+    } = &select.from[0].relation
+    else {
+        return None;
+    };
+    let inner = subquery.body.as_ref().as_select()?;
+    if inner.from.len() != 1
+        || !inner.from[0].joins.is_empty()
+        || inner.projection.len() != 1
+        || !matches!(inner.projection[0], SelectItem::Wildcard(_))
+        || inner.having.is_some()
+        || inner.distinct.is_some()
+        || !matches!(&inner.group_by, sqlparser::ast::GroupByExpr::Expressions(exprs, modifiers) if exprs.is_empty() && modifiers.is_empty())
+    {
+        return None;
+    }
+    let TableFactor::Table {
+        name: inner_name,
+        alias: inner_table_alias,
+        args,
+        ..
+    } = &inner.from[0].relation
+    else {
+        return None;
+    };
+    if args.is_some()
+        || inner_name.0.len() != 1
+        || !inner_name
+            .0
+            .last()
+            .and_then(|part| part.as_ident())
+            .is_some_and(|id| id.value.eq_ignore_ascii_case("methods"))
+    {
+        return None;
+    }
+    let inner_alias = inner_table_alias
+        .as_ref()
+        .map(|a| a.name.value.as_str())
+        .unwrap_or("methods");
+    let filter = match &inner.selection {
+        None => None,
+        Some(Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        }) => {
+            let parse_mod = |expr: &Expr| -> Option<u32> {
+                let Expr::BinaryOp {
+                    left,
+                    op: BinaryOperator::Modulo,
+                    right,
+                } = expr
+                else {
+                    return None;
+                };
+                if !is_column_expr(left, "method_idx", None)
+                    && !is_column_expr(left, "method_idx", Some(inner_alias))
+                {
+                    return None;
+                }
+                let Expr::Value(value) = right.as_ref() else {
+                    return None;
+                };
+                let Value::Number(divisor, _) = &value.value else {
+                    return None;
+                };
+                Some(divisor.parse::<u32>().ok()?.max(1))
+            };
+            let parse_rem = |expr: &Expr| -> Option<u32> {
+                let Expr::Value(value) = expr else {
+                    return None;
+                };
+                let Value::Number(rem, _) = &value.value else {
+                    return None;
+                };
+                rem.parse().ok()
+            };
+            parse_mod(left)
+                .and_then(|divisor| parse_rem(right).map(|rem| (divisor, rem)))
+                .or_else(|| {
+                    parse_mod(right).and_then(|divisor| parse_rem(left).map(|rem| (divisor, rem)))
+                })
+        }
+        _ => return None,
+    };
+    let outer_name = outer_alias.name.value.as_str();
+    let outer_column = |expr: &Expr, column: &str| {
+        is_column_expr(expr, column, None) || is_column_expr(expr, column, Some(outer_name))
+    };
+    let expected = [
+        ("file_id", outer_name),
+        ("method_idx", outer_name),
+        ("name", outer_name),
+    ];
+    for (item, (column, _qualifier)) in select.projection.iter().zip(expected) {
+        let Some(expr) = item_expr(item) else {
+            return None;
+        };
+        if !outer_column(expr, column) {
+            return None;
+        }
+    }
+    let OrderByKind::Expressions(order) = &query.order_by.as_ref()?.kind else {
+        return None;
+    };
+    if order.len() != 3 {
+        return None;
+    }
+    let Expr::Function(length_fn) = &order[0].expr else {
+        return None;
+    };
+    if length_fn.name.to_string().to_ascii_lowercase() != "length"
+        || length_fn.over.is_some()
+        || length_fn.filter.is_some()
+        || !length_fn.within_group.is_empty()
+        || order[0].options.sort != Some(sqlparser::ast::OrderBySort::Desc)
+    {
+        return None;
+    }
+    let FunctionArguments::List(args) = &length_fn.args else {
+        return None;
+    };
+    if args.args.len() != 1 {
+        return None;
+    }
+    let FunctionArg::Unnamed(FunctionArgExpr::Expr(name_expr)) = &args.args[0] else {
+        return None;
+    };
+    if !outer_column(name_expr, "name")
+        || !outer_column(&order[1].expr, "file_id")
+        || order[1].options.sort == Some(sqlparser::ast::OrderBySort::Desc)
+        || !outer_column(&order[2].expr, "method_idx")
+        || order[2].options.sort == Some(sqlparser::ast::OrderBySort::Desc)
+    {
+        return None;
+    }
+    let sql_limit = query_limit_value(query.limit_clause.as_ref())? as u64;
+    let offset = query_offset_value(query.limit_clause.as_ref()).unwrap_or(0) as u64;
+    let limit = cli_limit.map_or(sql_limit, |cli| sql_limit.min(cli));
+    let needed = offset.saturating_add(limit) as usize;
+    let mut heap = BinaryHeap::with_capacity(needed.saturating_add(1));
+    if needed > 0 {
+        for file in &ds.files {
+            for method_idx in 0..file.methods.len() as u32 {
+                if let Some((divisor, remainder)) = filter {
+                    if method_idx % divisor != remainder {
+                        continue;
+                    }
+                }
+                let name = file.method_name(method_idx);
+                // Reverse file/method tie keys so the heap's smallest item is
+                // the worst retained candidate under the desired ordering.
+                let key = (
+                    name.chars().count() as i64,
+                    u32::MAX - file.file_id,
+                    u32::MAX - method_idx,
+                    file.file_id,
+                    method_idx,
+                    name.to_owned(),
+                );
+                if heap.len() < needed {
+                    heap.push(std::cmp::Reverse(key));
+                } else if heap.peek().is_some_and(|worst| key > worst.0) {
+                    heap.pop();
+                    heap.push(std::cmp::Reverse(key));
+                }
+            }
+        }
+    }
+    let mut selected: Vec<_> = heap.into_iter().map(|item| item.0).collect();
+    selected.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.3.cmp(&b.3))
+            .then_with(|| a.4.cmp(&b.4))
+    });
+    let rows = selected
+        .into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .map(|item| vec![item.3.to_string(), item.4.to_string(), item.5])
+        .collect();
+    Some(Ok(QueryResult {
+        columns: physical.columns,
+        rows,
+    }))
+}
+
+/// Count-only identity joins can be answered from the compact relation
+/// indexes without constructing either side's relational rows. This is a
+/// general proof-based path: it accepts only a single COUNT(*) projection,
+/// one inner join, and a complete identity key (or a descriptor identity).
+fn fast_relation_join_count(
+    query: &sqlparser::ast::Query,
+    ds: &Dataset,
+    cli_limit: Option<u64>,
+) -> Option<Result<QueryResult, String>> {
+    physical_methods::relation_count_shape(query)?;
+    use sqlparser::ast::{
+        Expr, FunctionArg, FunctionArgExpr, FunctionArguments, JoinConstraint, JoinOperator,
+        SelectItem, TableFactor,
+    };
+    let select = query.body.as_ref().as_select()?;
+    if select.projection.len() != 1
+        || select.from.len() != 1
+        || select.from[0].joins.len() != 1
+        || select.distinct.is_some()
+        || select.having.is_some()
+        || query.order_by.is_some()
+        || query.limit_clause.is_some()
+        || !matches!(&select.group_by, sqlparser::ast::GroupByExpr::Expressions(exprs, modifiers) if exprs.is_empty() && modifiers.is_empty())
+    {
+        return None;
+    }
+    let (SelectItem::UnnamedExpr(Expr::Function(function))
+    | SelectItem::ExprWithAlias {
+        expr: Expr::Function(function),
+        ..
+    }) = &select.projection[0]
+    else {
+        return None;
+    };
+    let FunctionArguments::List(args) = &function.args else {
+        return None;
+    };
+    if function.name.to_string().to_ascii_lowercase() != "count"
+        || function.over.is_some()
+        || function.filter.is_some()
+        || !function.within_group.is_empty()
+        || args.duplicate_treatment.is_some()
+        || !args.clauses.is_empty()
+        || args.args.len() != 1
+        || !matches!(
+            args.args[0],
+            FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+        )
+    {
+        return None;
+    }
+    let TableFactor::Table {
+        name: left_name,
+        alias: left_alias,
+        args: left_args,
+        ..
+    } = &select.from[0].relation
+    else {
+        return None;
+    };
+    let join = &select.from[0].joins[0];
+    let right_factor = &join.relation;
+    let TableFactor::Table {
+        name: right_name,
+        alias: right_alias,
+        args: right_args,
+        ..
+    } = right_factor
+    else {
+        return None;
+    };
+    if left_args.is_some()
+        || right_args.is_some()
+        || left_name.0.len() != 1
+        || right_name.0.len() != 1
+        || left_alias
+            .as_ref()
+            .is_some_and(|alias| !alias.columns.is_empty())
+        || right_alias
+            .as_ref()
+            .is_some_and(|alias| !alias.columns.is_empty())
+    {
+        return None;
+    }
+    let left = left_name.0.last()?.as_ident()?.value.to_ascii_lowercase();
+    let right = right_name.0.last()?.as_ident()?.value.to_ascii_lowercase();
+    let la = left_alias
+        .as_ref()
+        .map(|a| a.name.value.as_str())
+        .unwrap_or(&left);
+    let ra = right_alias
+        .as_ref()
+        .map(|a| a.name.value.as_str())
+        .unwrap_or(&right);
+    let (JoinOperator::Join(JoinConstraint::On(expr))
+    | JoinOperator::Inner(JoinConstraint::On(expr))) = &join.join_operator
+    else {
+        return None;
+    };
+    let mut conjuncts = Vec::new();
+    flatten_and(expr, &mut conjuncts);
+    if let Some(selection) = &select.selection {
+        flatten_and(selection, &mut conjuncts);
+    }
+    let mut pairs = HashSet::new();
+    for expr in conjuncts {
+        let Expr::BinaryOp {
+            left,
+            op: sqlparser::ast::BinaryOperator::Eq,
+            right,
+        } = expr
+        else {
+            return None;
+        };
+        let Some((a, ac)) = qualified_column(left) else {
+            return None;
+        };
+        let Some((b, bc)) = qualified_column(right) else {
+            return None;
+        };
+        let pair = if a.eq_ignore_ascii_case(la) && b.eq_ignore_ascii_case(ra) {
+            (ac, bc)
+        } else if b.eq_ignore_ascii_case(la) && a.eq_ignore_ascii_case(ra) {
+            (bc, ac)
+        } else {
+            return None;
+        };
+        pairs.insert(pair);
+    }
+    // Any additional ON conjunct must be evaluated normally; merely having
+    // an identity equality does not imply the remaining equalities are true.
+    if pairs.len() != 2 || !pairs.contains(&("file_id".to_owned(), "file_id".to_owned())) {
+        return None;
+    }
+    let count: i64 = match (left.as_str(), right.as_str()) {
+        ("methods", "method_strings") | ("method_strings", "methods")
+            if pairs.contains(&("method_idx".to_owned(), "method_idx".to_owned())) =>
+        {
+            ds.files
+                .iter()
+                .map(|file| {
+                    if file.method_string_count != 0 {
+                        file.method_string_count as i64
+                    } else {
+                        file.method_strings
+                            .iter()
+                            .filter(|row| (row.method_idx as usize) < file.methods.len())
+                            .count() as i64
+                    }
+                })
+                .sum()
+        }
+        ("methods", "method_calls")
+            if pairs.contains(&("method_idx".to_owned(), "callee_method_idx".to_owned())) =>
+        {
+            ds.files
+                .iter()
+                .map(|file| {
+                    file.method_calls
+                        .iter()
+                        .filter(|row| (row.callee_method_idx as usize) < file.methods.len())
+                        .count() as i64
+                })
+                .sum()
+        }
+        ("methods", "method_strings")
+            if pairs.contains(&("descriptor".to_owned(), "method".to_owned()))
+                && relational::unique_method_descriptors(ds) =>
+        {
+            ds.files
+                .iter()
+                .map(|file| {
+                    file.method_strings
+                        .iter()
+                        .filter(|edge| (edge.method_idx as usize) < file.methods.len())
+                        .count() as i64
+                })
+                .sum()
+        }
+        ("method_strings", "methods")
+            if pairs.contains(&("method".to_owned(), "descriptor".to_owned()))
+                && relational::unique_method_descriptors(ds) =>
+        {
+            ds.files
+                .iter()
+                .map(|file| {
+                    file.method_strings
+                        .iter()
+                        .filter(|edge| (edge.method_idx as usize) < file.methods.len())
+                        .count() as i64
+                })
+                .sum()
+        }
+        ("method_calls", "methods")
+            if pairs.contains(&("callee_method_idx".to_owned(), "method_idx".to_owned())) =>
+        {
+            ds.files
+                .iter()
+                .map(|file| {
+                    file.method_calls
+                        .iter()
+                        .filter(|row| (row.callee_method_idx as usize) < file.methods.len())
+                        .count() as i64
+                })
+                .sum()
+        }
+        ("classes", "methods") | ("methods", "classes")
+            if pairs.contains(&("class_idx".to_owned(), "class_idx".to_owned())) =>
+        {
+            ds.files
+                .iter()
+                .map(|file| {
+                    let mut classes = FxHashMap::<u32, i64>::default();
+                    for class in &file.classes {
+                        *classes.entry(class.class_idx).or_default() += 1;
+                    }
+                    file.methods
+                        .iter()
+                        .map(|method| {
+                            classes
+                                .get(&(method.class_idx as u32))
+                                .copied()
+                                .unwrap_or(0)
+                        })
+                        .sum::<i64>()
+                })
+                .sum()
+        }
+        _ => return None,
+    };
+    let label = match &select.projection[0] {
+        SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
+        _ => "count".to_owned(),
+    };
+    Some(Ok(QueryResult {
+        columns: vec![label],
+        rows: if cli_limit == Some(0) {
+            Vec::new()
+        } else {
+            vec![vec![count.to_string()]]
+        },
+    }))
 }
 
 /// Collect the base-table names reachable from a set-expression tree,
@@ -2613,6 +3323,360 @@ fn factor_table_name(factor: &sqlparser::ast::TableFactor) -> Option<String> {
         .last()
         .and_then(|part| part.as_ident())
         .map(|ident| ident.value.to_ascii_lowercase())
+}
+
+fn methods_source_alias<'a>(select: &'a sqlparser::ast::Select) -> Option<&'a str> {
+    let sqlparser::ast::TableFactor::Table {
+        name, alias, args, ..
+    } = &select.from.first()?.relation
+    else {
+        return None;
+    };
+    if args.is_some()
+        || name.0.len() != 1
+        || !name
+            .0
+            .last()?
+            .as_ident()?
+            .value
+            .eq_ignore_ascii_case("methods")
+    {
+        return None;
+    }
+    Some(
+        alias
+            .as_ref()
+            .map(|a| a.name.value.as_str())
+            .unwrap_or("methods"),
+    )
+}
+
+fn parse_method_mod_filter(expr: &sqlparser::ast::Expr, alias: &str) -> Option<(u32, u32)> {
+    use sqlparser::ast::{BinaryOperator, Expr, Value};
+    let Expr::BinaryOp {
+        left,
+        op: BinaryOperator::Eq,
+        right,
+    } = expr
+    else {
+        return None;
+    };
+    let parse_mod = |expr: &Expr| -> Option<u32> {
+        let Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Modulo,
+            right,
+        } = expr
+        else {
+            return None;
+        };
+        if !is_column_expr(left, "method_idx", None)
+            && !is_column_expr(left, "method_idx", Some(alias))
+        {
+            return None;
+        }
+        let Expr::Value(value) = right.as_ref() else {
+            return None;
+        };
+        let Value::Number(divisor, _) = &value.value else {
+            return None;
+        };
+        Some(divisor.parse::<u32>().ok()?.max(1))
+    };
+    let parse_value = |expr: &Expr| -> Option<u32> {
+        let Expr::Value(value) = expr else {
+            return None;
+        };
+        let Value::Number(rem, _) = &value.value else {
+            return None;
+        };
+        rem.parse().ok()
+    };
+    parse_mod(left)
+        .and_then(|divisor| parse_value(right).map(|rem| (divisor, rem)))
+        .or_else(|| {
+            parse_mod(right).and_then(|divisor| parse_value(left).map(|rem| (divisor, rem)))
+        })
+}
+
+/// Bounded top-k for a methods scan ordered by a scalar name-length key.
+/// The modulo predicate is pushed into the method-index loop and no relation
+/// row is materialized.
+fn fast_methods_expression_topk(
+    query: &sqlparser::ast::Query,
+    ds: &Dataset,
+    cli_limit: Option<u64>,
+) -> Option<Result<QueryResult, String>> {
+    let physical = physical_methods::expression_topk(query)?;
+    use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments, OrderByKind};
+    let select = query.body.as_ref().as_select()?;
+    if select.from.len() != 1
+        || !select.from[0].joins.is_empty()
+        || select.distinct.is_some()
+        || select.having.is_some()
+        || select.projection.len() != 3
+        || !matches!(&select.group_by, sqlparser::ast::GroupByExpr::Expressions(exprs, modifiers) if exprs.is_empty() && modifiers.is_empty())
+    {
+        return None;
+    }
+    let alias = methods_source_alias(select)?;
+    let filter = parse_method_mod_filter(select.selection.as_ref()?, alias)?;
+    let expected = [("file_id", alias), ("method_idx", alias)];
+    for (item, (column, qualifier)) in select.projection.iter().take(2).zip(expected) {
+        let Some(expr) = item_expr(item) else {
+            return None;
+        };
+        if !is_column_expr(expr, column, Some(qualifier)) && !is_column_expr(expr, column, None) {
+            return None;
+        }
+    }
+    let Some(n_expr) = item_expr(&select.projection[2]) else {
+        return None;
+    };
+    let Expr::Function(length_fn) = n_expr else {
+        return None;
+    };
+    if length_fn.name.to_string().to_ascii_lowercase() != "length"
+        || length_fn.over.is_some()
+        || length_fn.filter.is_some()
+        || !length_fn.within_group.is_empty()
+    {
+        return None;
+    }
+    let FunctionArguments::List(args) = &length_fn.args else {
+        return None;
+    };
+    if args.args.len() != 1 {
+        return None;
+    }
+    let FunctionArg::Unnamed(FunctionArgExpr::Expr(name_expr)) = &args.args[0] else {
+        return None;
+    };
+    if !is_column_expr(name_expr, "name", Some(alias)) && !is_column_expr(name_expr, "name", None) {
+        return None;
+    }
+    let OrderByKind::Expressions(order) = &query.order_by.as_ref()?.kind else {
+        return None;
+    };
+    if order.len() != 3
+        || order[0].options.sort != Some(sqlparser::ast::OrderBySort::Desc)
+        || !is_column_expr(&order[0].expr, &physical.columns[2], None)
+        || (order[1].options.sort == Some(sqlparser::ast::OrderBySort::Desc))
+        || (order[2].options.sort == Some(sqlparser::ast::OrderBySort::Desc))
+        || (!is_column_expr(&order[1].expr, "file_id", None)
+            && !is_column_expr(&order[1].expr, "file_id", Some(alias)))
+        || (!is_column_expr(&order[2].expr, "method_idx", None)
+            && !is_column_expr(&order[2].expr, "method_idx", Some(alias)))
+    {
+        return None;
+    }
+    let sql_limit = query_limit_value(query.limit_clause.as_ref())? as u64;
+    let offset = query_offset_value(query.limit_clause.as_ref()).unwrap_or(0) as u64;
+    let limit = cli_limit.map_or(sql_limit, |cli| sql_limit.min(cli));
+    let needed = offset.saturating_add(limit) as usize;
+    let mut heap = BinaryHeap::with_capacity(needed.saturating_add(1));
+    for file in &ds.files {
+        for method_idx in 0..file.methods.len() as u32 {
+            if method_idx % filter.0 != filter.1 {
+                continue;
+            }
+            let name = file.method_name(method_idx);
+            let key = (
+                name.chars().count() as i64,
+                u32::MAX - file.file_id,
+                u32::MAX - method_idx,
+                file.file_id,
+                method_idx,
+            );
+            if needed == 0 {
+                continue;
+            }
+            if heap.len() < needed {
+                heap.push(std::cmp::Reverse(key));
+            } else if heap.peek().is_some_and(|worst| key > worst.0) {
+                heap.pop();
+                heap.push(std::cmp::Reverse(key));
+            }
+        }
+    }
+    let mut selected: Vec<_> = heap.into_iter().map(|item| item.0).collect();
+    selected.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.3.cmp(&b.3))
+            .then_with(|| a.4.cmp(&b.4))
+    });
+    let rows = selected
+        .into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .map(|item| vec![item.3.to_string(), item.4.to_string(), item.0.to_string()])
+        .collect();
+    Some(Ok(QueryResult {
+        columns: physical.columns,
+        rows,
+    }))
+}
+
+/// Ordered LIMIT for the common pair of string predicates on `methods`.
+/// Scanning the physical method order lets the sink stop after the requested
+/// prefix instead of allocating and sorting the whole relation.
+fn fast_methods_string_predicate_limit(
+    query: &sqlparser::ast::Query,
+    ds: &Dataset,
+    cli_limit: Option<u64>,
+) -> Option<Result<QueryResult, String>> {
+    let physical = physical_methods::string_predicate_limit(query)?;
+    use sqlparser::ast::{
+        BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, OrderByKind, Value,
+    };
+    let select = query.body.as_ref().as_select()?;
+    if select.from.len() != 1
+        || !select.from[0].joins.is_empty()
+        || select.distinct.is_some()
+        || select.having.is_some()
+        || select.projection.len() != 3
+        || !matches!(&select.group_by, sqlparser::ast::GroupByExpr::Expressions(exprs, modifiers) if exprs.is_empty() && modifiers.is_empty())
+    {
+        return None;
+    }
+    let alias = methods_source_alias(select)?;
+    let mut conjuncts = Vec::new();
+    flatten_and(select.selection.as_ref()?, &mut conjuncts);
+    if conjuncts.len() != 2 {
+        return None;
+    }
+    let mut length_threshold = None;
+    let mut initial = None;
+    for expr in conjuncts {
+        let Expr::BinaryOp { left, op, right } = expr else {
+            return None;
+        };
+        let Expr::Function(function) = left.as_ref() else {
+            return None;
+        };
+        let name = function.name.to_string().to_ascii_lowercase();
+        let FunctionArguments::List(args) = &function.args else {
+            return None;
+        };
+        if name == "length" {
+            if *op != BinaryOperator::Gt {
+                return None;
+            }
+            if args.args.len() != 1 {
+                return None;
+            }
+            let FunctionArg::Unnamed(FunctionArgExpr::Expr(arg)) = &args.args[0] else {
+                return None;
+            };
+            if !is_column_expr(arg, "name", Some(alias)) && !is_column_expr(arg, "name", None) {
+                return None;
+            }
+            let Expr::Value(value) = right.as_ref() else {
+                return None;
+            };
+            let Value::Number(number, _) = &value.value else {
+                return None;
+            };
+            length_threshold = Some(number.parse::<usize>().ok()?);
+        } else if name == "lower" {
+            if *op != BinaryOperator::Eq {
+                return None;
+            }
+            let FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) = args.args.first()? else {
+                return None;
+            };
+            let Expr::Function(substr) = inner else {
+                return None;
+            };
+            if substr.name.to_string().to_ascii_lowercase() != "substr" {
+                return None;
+            }
+            let FunctionArguments::List(substr_args) = &substr.args else {
+                return None;
+            };
+            if substr_args.args.len() != 3 {
+                return None;
+            }
+            let FunctionArg::Unnamed(FunctionArgExpr::Expr(name_expr)) = &substr_args.args[0]
+            else {
+                return None;
+            };
+            if !is_column_expr(name_expr, "name", Some(alias))
+                && !is_column_expr(name_expr, "name", None)
+            {
+                return None;
+            }
+            let FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(start))) =
+                &substr_args.args[1]
+            else {
+                return None;
+            };
+            let FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(length))) =
+                &substr_args.args[2]
+            else {
+                return None;
+            };
+            if start.value.to_string() != "1" || length.value.to_string() != "1" {
+                return None;
+            }
+            let Expr::Value(value) = right.as_ref() else {
+                return None;
+            };
+            let Value::SingleQuotedString(expected) = &value.value else {
+                return None;
+            };
+            initial = expected.chars().next().map(|c| c.to_ascii_lowercase());
+        } else {
+            return None;
+        }
+    }
+    let threshold = length_threshold?;
+    let initial = initial?;
+    let OrderByKind::Expressions(order) = &query.order_by.as_ref()?.kind else {
+        return None;
+    };
+    if order.len() != 2
+        || order
+            .iter()
+            .any(|entry| entry.options.sort == Some(sqlparser::ast::OrderBySort::Desc))
+        || (!is_column_expr(&order[0].expr, "file_id", None)
+            && !is_column_expr(&order[0].expr, "file_id", Some(alias)))
+        || (!is_column_expr(&order[1].expr, "method_idx", None)
+            && !is_column_expr(&order[1].expr, "method_idx", Some(alias)))
+    {
+        return None;
+    }
+    let sql_limit = query_limit_value(query.limit_clause.as_ref())? as u64;
+    let offset = query_offset_value(query.limit_clause.as_ref()).unwrap_or(0) as usize;
+    let limit = cli_limit.map_or(sql_limit, |cli| sql_limit.min(cli)) as usize;
+    let end = offset.saturating_add(limit);
+    let mut rows = Vec::with_capacity(end);
+    for file in &ds.files {
+        for method_idx in 0..file.methods.len() as u32 {
+            let name = file.method_name(method_idx);
+            if name.chars().count() <= threshold
+                || name.chars().next().map(|c| c.to_ascii_lowercase()) != Some(initial)
+            {
+                continue;
+            }
+            rows.push(vec![
+                file.file_id.to_string(),
+                method_idx.to_string(),
+                name.to_owned(),
+            ]);
+            if rows.len() >= end {
+                break;
+            }
+        }
+        if rows.len() >= end {
+            break;
+        }
+    }
+    let rows = rows.into_iter().skip(offset).take(limit).collect();
+    Some(Ok(QueryResult {
+        columns: physical.columns,
+        rows,
+    }))
 }
 
 /// Fast path for the very common DexKit query shape
@@ -3554,7 +4618,7 @@ fn fast_method_strings_topk(
             }
         }
         for (bit, string_idx) in wanted_indices {
-            let Some(methods) = file.method_strings_by_string.get(&string_idx) else {
+            let Some(methods) = file.string_reference_index().get(&string_idx) else {
                 continue;
             };
             for &method_idx in methods {
@@ -4110,6 +5174,12 @@ fn execute_query_rows(
     needs_method_opcode: bool,
 ) -> Result<SetRows, String> {
     let _membership_scope = membership::Scope::new();
+    let fused_query = if !cache_shadows_relation(&query.to_string(), named_caches) {
+        derived::query(query)
+    } else {
+        None
+    };
+    let query = fused_query.as_ref().unwrap_or(query);
     use sqlparser::ast::SetExpr;
     let scope = match query.with.as_ref() {
         Some(with) => Some(prepare_with_scope(with, ds, source_dataset, named_caches)?),
@@ -4602,9 +5672,18 @@ fn desugar_select(
         .filter(|alias| !alias.is_empty())
         .collect();
     for item in &mut select.projection {
-        if let sqlparser::ast::SelectItem::UnnamedExpr(expr)
-        | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } = item
-        {
+        if let sqlparser::ast::SelectItem::UnnamedExpr(expr) = item {
+            let label = expression_label(expr);
+            let rewritten = desugar_expr(expr, ds, source_dataset, named_caches, &outer_aliases)?;
+            if expression_label(&rewritten) != label {
+                *item = sqlparser::ast::SelectItem::ExprWithAlias {
+                    expr: rewritten,
+                    alias: sqlparser::ast::Ident::new(label),
+                };
+            } else {
+                *expr = rewritten;
+            }
+        } else if let sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } = item {
             *expr = desugar_expr(expr, ds, source_dataset, named_caches, &outer_aliases)?;
         }
     }
@@ -4613,6 +5692,30 @@ fn desugar_select(
     }
     if let Some(having) = &mut select.having {
         *having = desugar_expr(having, ds, source_dataset, named_caches, &outer_aliases)?;
+    }
+    if let sqlparser::ast::GroupByExpr::Expressions(expressions, _) = &mut select.group_by {
+        for expr in expressions {
+            *expr = desugar_expr(expr, ds, source_dataset, named_caches, &outer_aliases)?;
+        }
+    }
+    for table in &mut select.from {
+        for join in &mut table.joins {
+            use sqlparser::ast::{JoinConstraint, JoinOperator};
+            let constraint = match &mut join.join_operator {
+                JoinOperator::Join(constraint)
+                | JoinOperator::Inner(constraint)
+                | JoinOperator::CrossJoin(constraint)
+                | JoinOperator::Left(constraint)
+                | JoinOperator::LeftOuter(constraint)
+                | JoinOperator::Right(constraint)
+                | JoinOperator::RightOuter(constraint)
+                | JoinOperator::FullOuter(constraint) => Some(constraint),
+                _ => None,
+            };
+            if let Some(JoinConstraint::On(expr)) = constraint {
+                *expr = desugar_expr(expr, ds, source_dataset, named_caches, &outer_aliases)?;
+            }
+        }
     }
     Ok(())
 }
@@ -4625,86 +5728,139 @@ fn desugar_expr(
     outer_aliases: &HashSet<String>,
 ) -> Result<sqlparser::ast::Expr, String> {
     use sqlparser::ast::Expr;
-    match expr {
-        Expr::Subquery(subquery) => {
-            let (_, rows) =
-                execute_query_rows(subquery, ds, source_dataset, named_caches, None, false)?;
-            let value = rows
-                .first()
-                .and_then(|row| row.first().cloned())
-                .unwrap_or(Scalar::Null);
-            Ok(scalar_literal(value))
+    let mut rewritten = expr.clone();
+    let mut failure = None;
+    // This walk visits function arguments, CASE branches, casts, and ordinary
+    // operators as well as the original binary/unary forms. A subquery owns
+    // its lexical scope, so replace it without walking into its query AST.
+    let _ = streaming::walk(&mut rewritten, &mut |expr| {
+        if failure.is_some() {
+            return Some(true);
         }
-        Expr::Exists {
-            subquery, negated, ..
-        } => {
-            if let Some(expr) =
-                correlated::exists(subquery, *negated, outer_aliases, ds, named_caches)?
-            {
-                return Ok(expr);
+        let replacement = (|| -> Result<Option<Expr>, String> {
+            match expr {
+                Expr::Subquery(subquery) => {
+                    if let Some(expr) = correlated::scalar(
+                        subquery,
+                        outer_aliases,
+                        ds,
+                        source_dataset,
+                        named_caches,
+                    )? {
+                        return Ok(Some(expr));
+                    }
+                    let (_, rows) = execute_query_rows(
+                        subquery,
+                        ds,
+                        source_dataset,
+                        named_caches,
+                        Some(1),
+                        false,
+                    )?;
+                    Ok(Some(scalar_literal(
+                        rows.first()
+                            .and_then(|row| row.first().cloned())
+                            .unwrap_or(Scalar::Null),
+                    )))
+                }
+                Expr::Exists {
+                    subquery, negated, ..
+                } => {
+                    if let Some(expr) =
+                        correlated::exists(subquery, *negated, outer_aliases, ds, named_caches)?
+                    {
+                        return Ok(Some(expr));
+                    }
+                    let (_, rows) = execute_query_rows(
+                        subquery,
+                        ds,
+                        source_dataset,
+                        named_caches,
+                        Some(1),
+                        false,
+                    )?;
+                    Ok(Some(scalar_literal(Scalar::Int(
+                        (!rows.is_empty() != *negated) as i64,
+                    ))))
+                }
+                Expr::InSubquery {
+                    expr: value,
+                    subquery,
+                    negated,
+                } => {
+                    let value =
+                        desugar_expr(value, ds, source_dataset, named_caches, outer_aliases)?;
+                    if let Some(expr) = correlated::in_subquery(
+                        subquery,
+                        value.clone(),
+                        *negated,
+                        outer_aliases,
+                        ds,
+                        source_dataset,
+                        named_caches,
+                    )? {
+                        return Ok(Some(expr));
+                    }
+                    let (_, mut rows) = execute_query_rows(
+                        subquery,
+                        ds,
+                        source_dataset,
+                        named_caches,
+                        None,
+                        false,
+                    )?;
+                    // The reference's relation-free subquery provider keeps
+                    // its projection row for IN evaluation even when its
+                    // local WHERE is false. This oddity is observable only
+                    // for a no-FROM subquery and is preserved for compatibility.
+                    if rows.is_empty()
+                        && subquery.body.as_select().is_some_and(|select| {
+                            select.from.is_empty() && select.selection.is_some()
+                        })
+                    {
+                        if let Some(select) = subquery.body.as_select() {
+                            let row = select
+                                .projection
+                                .iter()
+                                .filter_map(item_expr)
+                                .map(|expr| eval_scalar(expr, &RelRow::default(), &[]))
+                                .collect::<Result<Vec<_>, _>>()?;
+                            if !row.is_empty() {
+                                rows.push(row);
+                            }
+                        }
+                    }
+                    let mut values = membership::Values::default();
+                    let mut bytes = 0;
+                    for row in rows {
+                        if let Some(value) = row.into_iter().next() {
+                            bytes += values.insert(value);
+                            charge_materialized(bytes)?;
+                        }
+                    }
+                    Ok(Some(membership::register_membership(
+                        std::collections::HashMap::from([(membership::KeyTuple::Empty, values)]),
+                        *negated,
+                        Vec::new(),
+                        value,
+                    )))
+                }
+                _ => Ok(None),
             }
-            let (_, rows) =
-                execute_query_rows(subquery, ds, source_dataset, named_caches, Some(1), false)?;
-            let mut truth = !rows.is_empty();
-            if *negated {
-                truth = !truth;
+        })();
+        match replacement {
+            Ok(Some(replacement)) => {
+                *expr = replacement;
+                Some(true)
             }
-            Ok(scalar_literal(Scalar::Int(truth as i64)))
+            Ok(None) => Some(false),
+            Err(error) => {
+                failure = Some(error);
+                Some(true)
+            }
         }
-        Expr::InSubquery {
-            expr,
-            subquery,
-            negated,
-        } => {
-            let (_, rows) =
-                execute_query_rows(subquery, ds, source_dataset, named_caches, None, false)?;
-            let list = rows
-                .into_iter()
-                .filter_map(|row| row.into_iter().next())
-                .map(scalar_literal)
-                .collect::<Vec<_>>();
-            Ok(Expr::InList {
-                expr: Box::new(expr.as_ref().clone()),
-                list,
-                negated: *negated,
-            })
-        }
-        Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
-            left: Box::new(desugar_expr(
-                left,
-                ds,
-                source_dataset,
-                named_caches,
-                outer_aliases,
-            )?),
-            op: op.clone(),
-            right: Box::new(desugar_expr(
-                right,
-                ds,
-                source_dataset,
-                named_caches,
-                outer_aliases,
-            )?),
-        }),
-        Expr::UnaryOp { op, expr } => Ok(Expr::UnaryOp {
-            op: *op,
-            expr: Box::new(desugar_expr(
-                expr,
-                ds,
-                source_dataset,
-                named_caches,
-                outer_aliases,
-            )?),
-        }),
-        Expr::Nested(expr) => Ok(Expr::Nested(Box::new(desugar_expr(
-            expr,
-            ds,
-            source_dataset,
-            named_caches,
-            outer_aliases,
-        )?))),
-        _ => Ok(expr.clone()),
-    }
+    });
+    failure.map_or(Ok(rewritten), Err)
 }
 
 /// Return a safe physical row limit for a simple single-table SELECT.  The
@@ -5183,10 +6339,14 @@ fn execute_select_core(
         let mut initialized = false;
         for table in &select.from {
             let relation_alias = factor_alias(&table.relation);
-            let local = select
-                .selection
-                .as_ref()
-                .and_then(|expr| push_predicates(expr, relation_alias));
+            let local = if select.from.len() == 1 && table.joins.is_empty() {
+                select
+                    .selection
+                    .as_ref()
+                    .and_then(|expr| push_predicates(expr, relation_alias))
+            } else {
+                None
+            };
             let mut current = scan_factor(
                 &table.relation,
                 ds,
@@ -5198,28 +6358,29 @@ fn execute_select_core(
                 scan_limit,
                 scan_columns.as_ref(),
             )?;
+            let mut current_schema = relational::template(&table.relation, &current, named_caches);
             for join in &table.joins {
-                let right_alias = factor_alias(&join.relation);
-                let local = select
-                    .selection
-                    .as_ref()
-                    .and_then(|expr| push_predicates(expr, right_alias));
-                let constraint = join_constraint(&join.join_operator)?;
-                let join_keys = derive_join_keys(constraint, &current, right_alias)?;
                 let right = scan_factor(
                     &join.relation,
                     ds,
-                    local.as_deref(),
-                    join_keys
-                        .as_ref()
-                        .map(|(column, values)| (column.as_str(), values)),
+                    None,
+                    None,
                     needs_method_opcode,
                     named_caches,
                     source_dataset,
                     None,
                     None,
                 )?;
-                current = join_rows(&current, &right, constraint)?;
+                let right_schema = relational::template(&join.relation, &right, named_caches);
+                current = relational::materialized_join(
+                    &current,
+                    &right,
+                    &current_schema,
+                    &right_schema,
+                    &join.join_operator,
+                    &join.relation,
+                )?;
+                current_schema = current_schema.merge(&right_schema);
             }
             if !initialized {
                 all = current;
@@ -5242,7 +6403,7 @@ fn execute_select_core(
         rows.retain(|row| eval_bool(selection, row, &[]).unwrap_or(false));
     }
 
-    let group_exprs = match &select.group_by {
+    let mut group_exprs = match &select.group_by {
         sqlparser::ast::GroupByExpr::Expressions(exprs, modifiers) => {
             if !modifiers.is_empty() {
                 return Err("unsupported GROUP BY modifier".into());
@@ -5264,17 +6425,17 @@ fn execute_select_core(
                 .collect()
         }
     };
+    let source_columns = rows
+        .first()
+        .map(|row| row.columns.as_slice())
+        .unwrap_or(&[]);
+    resolve_group_refs(&mut group_exprs, &select.projection, source_columns);
     let has_aggregate = select
         .projection
         .iter()
         .any(|item| item_expr(item).is_some_and(item_has_aggregate))
         || select.having.as_ref().is_some_and(item_has_aggregate);
     let grouped = group_rows(rows, &group_exprs, has_aggregate)?;
-
-    let mut grouped = grouped;
-    if let Some(having) = &select.having {
-        grouped.retain(|group| eval_bool(having, &group.row, &group.members).unwrap_or(false));
-    }
 
     let fallback_columns = if grouped.is_empty() {
         select
@@ -5285,7 +6446,13 @@ fn execute_select_core(
     } else {
         Vec::new()
     };
-    let (projection, columns) = expand_projection(&select.projection, &grouped, &fallback_columns)?;
+    let qualified_sources = relational::wildcard_sources(select, named_caches);
+    let (projection, columns) = expand_projection(
+        &select.projection,
+        &grouped,
+        &fallback_columns,
+        &qualified_sources,
+    )?;
     let mut projected = Vec::with_capacity(grouped.len());
     for group in grouped {
         let mut values = Vec::with_capacity(projection.len());
@@ -5301,6 +6468,13 @@ fn execute_select_core(
                 intern_rel_component(lower_rel_component(label).as_ref()),
                 value.clone(),
             );
+        }
+        if select
+            .having
+            .as_ref()
+            .is_some_and(|having| !eval_bool(having, &order_row, &group.members).unwrap_or(false))
+        {
+            continue;
         }
         projected.push(ProjectedRow {
             values,
@@ -5468,59 +6642,78 @@ fn item_expr(item: &sqlparser::ast::SelectItem) -> Option<&sqlparser::ast::Expr>
     }
 }
 
+/// GROUP BY accepts output aliases and one-based projection ordinals. A real
+/// source column keeps precedence over a same-named output alias.
+fn resolve_group_refs(
+    expressions: &mut [sqlparser::ast::Expr],
+    projection: &[sqlparser::ast::SelectItem],
+    source_columns: &[impl AsRef<str>],
+) {
+    use sqlparser::ast::{Expr, SelectItem, Value};
+    for expr in expressions {
+        let replacement = match expr {
+            Expr::Identifier(id)
+                if !source_columns
+                    .iter()
+                    .any(|name| name.as_ref().eq_ignore_ascii_case(&id.value)) =>
+            {
+                projection.iter().find_map(|item| {
+                    if let SelectItem::ExprWithAlias { expr, alias } = item {
+                        alias
+                            .value
+                            .eq_ignore_ascii_case(&id.value)
+                            .then_some(expr.clone())
+                    } else {
+                        None
+                    }
+                })
+            }
+            Expr::Value(value) => match &value.value {
+                Value::Number(number, _) => number
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|index| projection.get(index.wrapping_sub(1)))
+                    .and_then(item_expr)
+                    .cloned(),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(replacement) = replacement {
+            *expr = replacement;
+        }
+    }
+}
+
 fn item_has_aggregate(expr: &sqlparser::ast::Expr) -> bool {
-    use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
-    match expr {
-        Expr::Function(function) => {
+    use sqlparser::ast::{Expr, FunctionArguments};
+    let mut found = false;
+    let mut expr = expr.clone();
+    let _ = streaming::walk(&mut expr, &mut |expr| {
+        if let Expr::Function(function) = expr {
             let name = function
                 .name
                 .0
                 .last()
-                .map(|name| name.to_string().to_ascii_lowercase())
-                .unwrap_or_default();
-            let FunctionArguments::List(args) = &function.args else {
-                return false;
+                .map(ToString::to_string)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let arguments = match &function.args {
+                FunctionArguments::List(args) => args.args.len(),
+                _ => 0,
             };
-            matches!(
+            if matches!(
                 name.as_str(),
-                "count" | "sum" | "total" | "avg" | "group_concat" | "string_agg"
-            ) || matches!(name.as_str(), "min" | "max") && args.args.len() == 1
-                || args.args.iter().any(|arg| match arg {
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => item_has_aggregate(expr),
-                    _ => false,
-                })
+                "count" | "sum" | "avg" | "total" | "group_concat" | "string_agg"
+            ) || matches!(name.as_str(), "min" | "max") && arguments == 1
+            {
+                found = true;
+                return Some(true);
+            }
         }
-        Expr::BinaryOp { left, right, .. } => item_has_aggregate(left) || item_has_aggregate(right),
-        Expr::UnaryOp { expr, .. }
-        | Expr::Nested(expr)
-        | Expr::IsNull(expr)
-        | Expr::IsNotNull(expr) => item_has_aggregate(expr),
-        Expr::InList { expr, list, .. } => {
-            item_has_aggregate(expr) || list.iter().any(item_has_aggregate)
-        }
-        Expr::Between {
-            expr, low, high, ..
-        } => item_has_aggregate(expr) || item_has_aggregate(low) || item_has_aggregate(high),
-        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
-            item_has_aggregate(expr) || item_has_aggregate(pattern)
-        }
-        Expr::Substring {
-            expr,
-            substring_from,
-            substring_for,
-            ..
-        } => {
-            item_has_aggregate(expr)
-                || substring_from.as_deref().is_some_and(item_has_aggregate)
-                || substring_for.as_deref().is_some_and(item_has_aggregate)
-        }
-        Expr::Trim {
-            expr,
-            trim_characters,
-            ..
-        } => item_has_aggregate(expr) || trim_characters.iter().flatten().any(item_has_aggregate),
-        _ => false,
-    }
+        Some(false)
+    });
+    found
 }
 
 fn group_rows(
@@ -5772,6 +6965,7 @@ fn expand_projection(
     projection: &[sqlparser::ast::SelectItem],
     grouped: &[GroupedRow],
     fallback_columns: &[String],
+    qualified_sources: &FxHashMap<String, Vec<String>>,
 ) -> Result<(Vec<(sqlparser::ast::Expr, String)>, Vec<String>), String> {
     let source_columns: Vec<String> = grouped
         .first()
@@ -5803,20 +6997,17 @@ fn expand_projection(
                     return Err("invalid qualified wildcard".into());
                 };
                 let qualifier = qualifier.value.clone();
-                for column in &source_columns {
-                    let key = format!("{}.{}", qualifier.to_ascii_lowercase(), column);
-                    if grouped
-                        .first()
-                        .is_some_and(|group| group.row.values.contains_key(key.as_str()))
-                    {
-                        output.push((
-                            sqlparser::ast::Expr::CompoundIdentifier(vec![
-                                sqlparser::ast::Ident::new(qualifier.clone()),
-                                sqlparser::ast::Ident::new(column),
-                            ]),
-                            column.clone(),
-                        ));
-                    }
+                let columns = qualified_sources
+                    .get(&qualifier.to_ascii_lowercase())
+                    .ok_or_else(|| format!("unknown relation qualifier '{qualifier}'"))?;
+                for column in columns {
+                    output.push((
+                        sqlparser::ast::Expr::CompoundIdentifier(vec![
+                            sqlparser::ast::Ident::new(qualifier.clone()),
+                            sqlparser::ast::Ident::new(column),
+                        ]),
+                        column.clone(),
+                    ));
                 }
             }
             sqlparser::ast::SelectItem::UnnamedExpr(expr) => {
@@ -5884,76 +7075,23 @@ fn join_rows(
     right: &[RelRow],
     constraint: Option<&sqlparser::ast::Expr>,
 ) -> Result<Vec<RelRow>, String> {
-    let Some(constraint) = constraint else {
-        let product = left.len().saturating_mul(right.len());
-        if product > 5_000_000 {
-            return Err("unsupported SQL: large cross join without an equality condition".into());
+    let nulls = |rows: &[RelRow]| {
+        let mut row = rows.first().cloned().unwrap_or_default();
+        for value in row.values.values_mut() {
+            *value = Scalar::Null;
         }
-        let mut merged = Vec::new();
-        let mut retained_bytes = 0;
-        for left_row in left {
-            for right_row in right {
-                push_reference_row(&mut merged, left_row.merge(right_row), &mut retained_bytes)?;
-            }
-        }
-        return Ok(merged);
+        row
     };
-    let mut conjuncts = Vec::new();
-    flatten_and(constraint, &mut conjuncts);
-    let mut keys = Vec::new();
-    for expr in conjuncts {
-        let sqlparser::ast::Expr::BinaryOp {
-            left: a,
-            op: sqlparser::ast::BinaryOperator::Eq,
-            right: b,
-        } = expr
-        else {
-            continue;
-        };
-        if let (Some(left), Some(right)) = (left.first(), right.first()) {
-            if eval_scalar(a, left, &[]).is_ok() && eval_scalar(b, right, &[]).is_ok() {
-                keys.push((a.as_ref(), b.as_ref()));
-            } else if eval_scalar(b, left, &[]).is_ok() && eval_scalar(a, right, &[]).is_ok() {
-                keys.push((b.as_ref(), a.as_ref()));
-            }
-        }
-    }
-    if left.is_empty() || right.is_empty() {
-        return Ok(Vec::new());
-    }
-    if keys.is_empty() {
-        return Err("unsupported SQL: JOIN requires an equality ON condition".into());
-    }
-    let make_key = |row: &RelRow, right: bool| -> Result<Option<Vec<membership::Key>>, String> {
-        keys.iter()
-            .map(|(a, b)| {
-                eval_scalar(if right { b } else { a }, row, &[])
-                    .map(|value| membership::key(&value))
-            })
-            .collect::<Result<Option<Vec<_>>, _>>()
-    };
-    let mut index: FxHashMap<Vec<membership::Key>, Vec<&RelRow>> = FxHashMap::default();
-    for row in right {
-        if let Some(key) = make_key(row, true)? {
-            index.entry(key).or_default().push(row);
-        }
-    }
-    let mut joined = Vec::new();
-    let mut retained_bytes = 0;
-    for left_row in left {
-        let Some(key) = make_key(left_row, false)? else {
-            continue;
-        };
-        if let Some(matches) = index.get(&key) {
-            for right_row in matches {
-                let merged = left_row.merge(right_row);
-                if eval_bool(constraint, &merged, &[])? {
-                    push_reference_row(&mut joined, merged, &mut retained_bytes)?;
-                }
-            }
-        }
-    }
-    Ok(joined)
+    relational::materialized_rows(
+        left,
+        right,
+        &nulls(left),
+        &nulls(right),
+        relational::Kind::Inner,
+        constraint,
+        &[],
+        "",
+    )
 }
 
 fn derive_join_keys(
@@ -7811,6 +8949,10 @@ fn scan_classes(
             if needs("source_file") {
                 row.put(alias, "source_file", Scalar::text(source));
             }
+            // Computed count extensions remain addressable explicitly; the
+            // native classes wildcard has the eight physical view columns.
+            row.columns
+                .retain(|column| !matches!(column.as_ref(), "field_count" | "method_count"));
             push_reference_row(rows, row, &mut retained_bytes)?;
             Ok(scan_limit.is_some_and(|limit| rows.len() >= limit))
         };
@@ -8190,7 +9332,7 @@ fn scan_method_strings(
                 let Some(string_idx) = file.find_string_idx(value.as_ref()) else {
                     continue;
                 };
-                if let Some(methods) = file.method_strings_by_string.get(&string_idx) {
+                if let Some(methods) = file.string_reference_index().get(&string_idx) {
                     for &method_idx in methods {
                         // A method may load the same string more than once;
                         // method_strings is a reference relation and keeps
@@ -9824,7 +10966,7 @@ fn like_match(value: &str, pattern: &str, escape: Option<char>) -> bool {
         }
         tokens.push(match ch {
             '%' => Token::AnySeq,
-            '_' => Token::AnyOne,
+            '_' if escape.is_some() => Token::AnyOne,
             literal => Token::Lit(literal),
         });
     }
@@ -9963,6 +11105,9 @@ fn eval_scalar(
     use sqlparser::ast::{
         BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, UnaryOperator,
     };
+    if let Some(result) = expressions::evaluate(expr, row, group) {
+        return result;
+    }
     match expr {
         Expr::Identifier(id) => row
             .get(&id.value)
@@ -10010,126 +11155,13 @@ fn eval_scalar(
         }
         Expr::BinaryOp { left, op, right } => {
             let a = eval_scalar(left, row, group)?;
-            let b = eval_scalar(right, row, group)?;
-            match op {
-                BinaryOperator::Plus | BinaryOperator::Minus | BinaryOperator::Multiply => {
-                    if matches!(a, Scalar::Null) || matches!(b, Scalar::Null) {
-                        return Ok(Scalar::Null);
-                    };
-                    let (Some(x), Some(y)) = (a.numeric(), b.numeric()) else {
-                        return Err("arithmetic requires numeric values".into());
-                    };
-                    // SQLite typing: int op int stays int (promoting to real
-                    // on overflow); any real operand makes the result real.
-                    let both_int = matches!(a, Scalar::Int(_)) && matches!(b, Scalar::Int(_));
-                    if both_int {
-                        let (x, y) = (x as i64, y as i64);
-                        let z = match op {
-                            BinaryOperator::Plus => x.checked_add(y),
-                            BinaryOperator::Minus => x.checked_sub(y),
-                            _ => x.checked_mul(y),
-                        };
-                        return Ok(match z {
-                            Some(z) => Scalar::Int(z),
-                            None => scalar_functions::real_scalar(match op {
-                                BinaryOperator::Plus => x as f64 + y as f64,
-                                BinaryOperator::Minus => x as f64 - y as f64,
-                                _ => x as f64 * y as f64,
-                            }),
-                        });
-                    }
-                    let z = match op {
-                        BinaryOperator::Plus => x + y,
-                        BinaryOperator::Minus => x - y,
-                        _ => x * y,
-                    };
-                    Ok(scalar_functions::real_scalar(z))
-                }
-                BinaryOperator::Divide | BinaryOperator::Modulo => {
-                    if matches!(a, Scalar::Null) || matches!(b, Scalar::Null) {
-                        return Ok(Scalar::Null);
-                    }
-                    let (Some(x), Some(y)) = (a.numeric(), b.numeric()) else {
-                        return Err("arithmetic requires numeric values".into());
-                    };
-                    // Division by zero yields NULL, matching SQLite.
-                    if y == 0.0 {
-                        return Ok(Scalar::Null);
-                    }
-                    if matches!(a, Scalar::Int(_)) && matches!(b, Scalar::Int(_)) {
-                        let (x, y) = (x as i64, y as i64);
-                        return Ok(Scalar::Int(if matches!(op, BinaryOperator::Divide) {
-                            x.wrapping_div(y)
-                        } else {
-                            x.wrapping_rem(y)
-                        }));
-                    }
-                    let z = if matches!(op, BinaryOperator::Divide) {
-                        x / y
-                    } else {
-                        x % y
-                    };
-                    Ok(scalar_functions::real_scalar(z))
-                }
-                BinaryOperator::BitwiseAnd
-                | BinaryOperator::BitwiseOr
-                | BinaryOperator::BitwiseXor
-                | BinaryOperator::PGBitwiseShiftLeft
-                | BinaryOperator::PGBitwiseShiftRight => {
-                    if matches!(a, Scalar::Null) || matches!(b, Scalar::Null) {
-                        return Ok(Scalar::Null);
-                    }
-                    let (Some(x), Some(y)) = (a.numeric(), b.numeric()) else {
-                        return Err("bitwise operation requires numeric values".into());
-                    };
-                    let (x, y) = (x as i64, y as i64);
-                    let z = match op {
-                        BinaryOperator::BitwiseAnd => x & y,
-                        BinaryOperator::BitwiseOr => x | y,
-                        BinaryOperator::BitwiseXor => x ^ y,
-                        BinaryOperator::PGBitwiseShiftLeft => {
-                            if !(0..64).contains(&y) {
-                                0
-                            } else {
-                                x << y
-                            }
-                        }
-                        _ => {
-                            if !(0..64).contains(&y) {
-                                if x < 0 {
-                                    -1
-                                } else {
-                                    0
-                                }
-                            } else {
-                                x >> y
-                            }
-                        }
-                    };
-                    Ok(Scalar::Int(z))
-                }
-                BinaryOperator::And | BinaryOperator::Or => {
-                    let z = if matches!(op, BinaryOperator::And) {
-                        if !a.truthy() || !b.truthy() {
-                            0
-                        } else {
-                            1
-                        }
-                    } else if a.truthy() || b.truthy() {
-                        1
-                    } else {
-                        0
-                    };
-                    Ok(Scalar::Int(z))
-                }
-                _ => {
-                    if matches!(a, Scalar::Null) || matches!(b, Scalar::Null) {
-                        Ok(Scalar::Null)
-                    } else {
-                        Ok(Scalar::Int(eval_binary(op, &a, &b) as i64))
-                    }
-                }
+            if matches!(op, BinaryOperator::And) && !matches!(a, Scalar::Null) && !a.truthy() {
+                return Ok(Scalar::Int(0));
             }
+            if matches!(op, BinaryOperator::Or) && a.truthy() {
+                return Ok(Scalar::Int(1));
+            }
+            expressions::binary(op, &a, &eval_scalar(right, row, group)?)
         }
         Expr::Substring {
             expr,
@@ -10351,8 +11383,8 @@ fn eval_scalar(
                 .filter(|v| !matches!(v, Scalar::Null))
                 .collect::<Vec<_>>();
             if distinct {
-                vals.sort_by(compare_scalar);
-                vals.dedup_by(|a, b| a.sql_eq(b));
+                let mut seen = HashSet::new();
+                vals.retain(|value| seen.insert(membership::set_key(value)));
             }
             let sum_real =
                 || -> f64 { vals.iter().map(|v| v.numeric().unwrap_or(0.0)).sum::<f64>() };
@@ -10385,7 +11417,7 @@ fn eval_scalar(
                     let separator = match args.args.get(1) {
                         Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) => {
                             let value = eval_scalar(e, row, group)?;
-                            scalar_text(&value).ok_or("group_concat separator must be text")?
+                            scalar_text(&value).unwrap_or_default()
                         }
                         _ => ",".to_owned(),
                     };
@@ -10499,75 +11531,7 @@ fn eval_string_function(name: &str, values: &[Scalar]) -> Result<Scalar, String>
 }
 
 fn eval_bool(expr: &sqlparser::ast::Expr, row: &RelRow, group: &[RelRow]) -> Result<bool, String> {
-    use sqlparser::ast::{BinaryOperator, Expr};
-    match expr {
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::And,
-            right,
-        } => Ok(eval_bool(left, row, group)? && eval_bool(right, row, group)?),
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::Or,
-            right,
-        } => Ok(eval_bool(left, row, group)? || eval_bool(right, row, group)?),
-        Expr::BinaryOp { left, op, right } => Ok(eval_binary(
-            op,
-            &eval_scalar(left, row, group)?,
-            &eval_scalar(right, row, group)?,
-        )),
-        Expr::UnaryOp {
-            op: sqlparser::ast::UnaryOperator::Not,
-            expr,
-        } => {
-            let value = eval_scalar(expr, row, group)?;
-            Ok(!matches!(value, Scalar::Null) && !value.truthy())
-        }
-        Expr::Nested(e) => eval_bool(e, row, group),
-        Expr::InList { .. } => Ok(eval_scalar(expr, row, group)?.truthy()),
-        Expr::Like {
-            expr,
-            pattern,
-            negated,
-            escape_char,
-            ..
-        }
-        | Expr::ILike {
-            expr,
-            pattern,
-            negated,
-            escape_char,
-            ..
-        } => {
-            let v = eval_scalar(expr, row, group)?;
-            let p = eval_scalar(pattern, row, group)?;
-            if matches!(v, Scalar::Null) | matches!(p, Scalar::Null) {
-                return Ok(false);
-            };
-            let escape = match escape_char {
-                None => None,
-                Some(escape_expr) => {
-                    let value = eval_scalar(escape_expr, row, group)?;
-                    let Scalar::Text(text) = value else {
-                        return Err("ESCAPE expression must be a one-character string".into());
-                    };
-                    let mut chars = text.chars();
-                    let Some(escape) = chars.next() else {
-                        return Err("ESCAPE expression must be a one-character string".into());
-                    };
-                    if chars.next().is_some() {
-                        return Err("ESCAPE expression must be a one-character string".into());
-                    }
-                    Some(escape)
-                }
-            };
-            let f = like_match(&v.display(), &p.display(), escape);
-            Ok(if *negated { !f } else { f })
-        }
-        Expr::IsNull(e) => Ok(matches!(eval_scalar(e, row, group)?, Scalar::Null)),
-        Expr::IsNotNull(e) => Ok(!matches!(eval_scalar(e, row, group)?, Scalar::Null)),
-        _ => Ok(eval_scalar(expr, row, group)?.truthy()),
-    }
+    Ok(eval_scalar(expr, row, group)?.truthy())
 }
 
 fn apply_sql_limit(
@@ -11171,7 +12135,7 @@ mod fallback_reference_scan_tests {
             }),
         );
         let statements = sqlparser::parser::Parser::parse_sql(
-            &sqlparser::dialect::SQLiteDialect {},
+            &expressions::Dialect {},
             "SELECT l.payload FROM left_rows l, right_rows r",
         )
         .unwrap();

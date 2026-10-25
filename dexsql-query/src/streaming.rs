@@ -5,12 +5,15 @@
 use super::*;
 use dexsql_cache::{ClassInfo, DexFile};
 use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Select, SelectItem};
+mod eval;
+use eval::Prepared;
 
 #[derive(Clone)]
 struct Aggregate {
     key: Arc<str>,
     name: String,
     argument: Option<Expr>,
+    prepared_argument: Option<Prepared>,
     separator: Option<Expr>,
     distinct: bool,
 }
@@ -23,7 +26,7 @@ enum Accumulator {
 }
 struct State {
     accumulator: Accumulator,
-    seen: Option<Box<HashSet<membership::Key>>>,
+    seen: Option<Box<rustc_hash::FxHashSet<membership::Key>>>,
 }
 impl State {
     fn extra_bytes(&self) -> u64 {
@@ -47,12 +50,14 @@ impl State {
         };
         Self {
             accumulator,
-            seen: spec.distinct.then(|| Box::new(HashSet::new())),
+            seen: spec
+                .distinct
+                .then(|| Box::new(rustc_hash::FxHashSet::default())),
         }
     }
     fn update(&mut self, spec: &Aggregate, row: &RelRow) -> Result<(), String> {
-        let value = match &spec.argument {
-            Some(expr) => match eval_scalar(expr, row, &[]) {
+        let value = match &spec.prepared_argument {
+            Some(expr) => match expr.evaluate(row) {
                 Ok(value) => value,
                 Err(_) if spec.name == "count" => return Ok(()),
                 Err(error) => return Err(error),
@@ -111,14 +116,9 @@ impl State {
             Accumulator::Concat(parts) if parts.is_empty() => Scalar::Null,
             Accumulator::Concat(parts) => {
                 let separator = match &spec.separator {
-                    Some(expr) => scalar_text(&eval_scalar(expr, row, &[])?)
-                        .ok_or("group_concat separator must be text")?,
+                    Some(expr) => scalar_text(&eval_scalar(expr, row, &[])?).unwrap_or_default(),
                     None => ",".to_owned(),
                 };
-                let mut parts = parts.clone();
-                if spec.distinct {
-                    parts.sort_by(compare_scalar);
-                }
                 Scalar::text(
                     parts
                         .iter()
@@ -141,19 +141,39 @@ pub(super) fn walk(expr: &mut Expr, f: &mut impl FnMut(&mut Expr) -> Option<bool
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Value(_) => {}
         Expr::Nested(expr)
         | Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
         | Expr::IsNull(expr)
         | Expr::IsNotNull(expr)
         | Expr::IsTrue(expr)
         | Expr::IsNotTrue(expr)
         | Expr::IsFalse(expr)
         | Expr::IsNotFalse(expr) => walk(expr, f)?,
-        Expr::BinaryOp { left, right, .. } => {
+        Expr::BinaryOp { left, right, .. }
+        | Expr::IsDistinctFrom(left, right)
+        | Expr::IsNotDistinctFrom(left, right) => {
             walk(left, f)?;
             walk(right, f)?;
         }
         Expr::InList { expr, list, .. } => {
             walk(expr, f)?;
             for expr in list {
+                walk(expr, f)?;
+            }
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(expr) = operand {
+                walk(expr, f)?;
+            }
+            for branch in conditions {
+                walk(&mut branch.condition, f)?;
+                walk(&mut branch.result, f)?;
+            }
+            if let Some(expr) = else_result {
                 walk(expr, f)?;
             }
         }
@@ -226,6 +246,9 @@ pub(super) fn walk(expr: &mut Expr, f: &mut impl FnMut(&mut Expr) -> Option<bool
             for arg in &mut args.args {
                 match arg {
                     FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => walk(expr, f)?,
+                    FunctionArg::Unnamed(
+                        FunctionArgExpr::Wildcard | FunctionArgExpr::QualifiedWildcard(_),
+                    ) => {}
                     _ => return None,
                 }
             }
@@ -315,6 +338,7 @@ fn rewrite(
                         key: key.clone(),
                         name,
                         argument,
+                        prepared_argument: None,
                         separator,
                         distinct: args.duplicate_treatment
                             == Some(sqlparser::ast::DuplicateTreatment::Distinct),
@@ -410,20 +434,27 @@ pub(super) fn execute(
                 })
                 .collect::<Vec<_>>()
         });
+    let source_filter = select
+        .selection
+        .as_ref()
+        .map(Prepared::new)
+        .filter(|expr| expr.source_safe() && expr.source_columns_valid(&schema, alias));
     execute_with_input(
         query,
         select,
         &schema,
         alias,
         cli_limit,
+        source_order_prefix(query, select, ds, &table, alias),
         |columns, visit| {
             let columns = columns.iter().map(String::as_str).collect::<Vec<_>>();
-            visit_source(
+            visit_source_filtered(
                 ds,
                 &table,
                 alias,
                 &columns,
                 scan_predicates.as_deref(),
+                source_filter.as_ref(),
                 visit,
             )
         },
@@ -439,7 +470,70 @@ pub(super) fn execute_input(
     cli_limit: Option<u64>,
     visit: impl FnOnce(&[String], &mut dyn FnMut(&RelRow) -> Result<bool, String>) -> Result<(), String>,
 ) -> Option<Result<SelectOutput, String>> {
-    execute_with_input(query, select, schema, "", cli_limit, visit)
+    execute_with_input(query, select, schema, "", cli_limit, 0, visit)
+}
+
+/// Prove that a source's native cursor order satisfies the complete requested
+/// ordering. LIMIT/OFFSET can then stop the cursor once its prefix is full.
+/// Aliases and ORDER BY positions resolve through the submitted projection.
+fn source_order_prefix(
+    query: &sqlparser::ast::Query,
+    select: &Select,
+    ds: &Dataset,
+    table: &str,
+    alias: &str,
+) -> usize {
+    let Some(order) = &query.order_by else {
+        return 0;
+    };
+    let sqlparser::ast::OrderByKind::Expressions(order) = &order.kind else {
+        return 0;
+    };
+    let keys: &[&str] = match table {
+        "methods" | "method_ids" => &["file_id", "method_idx"],
+        "fields" | "field_ids" => &["file_id", "field_idx"],
+        "strings" => &["string_pool_id", "string_idx"],
+        "types" | "type_ids" => &["file_id", "type_idx"],
+        "protos" | "proto_ids" => &["file_id", "proto_idx"],
+        "dex_files" => &["file_id"],
+        "classes"
+            if ds.files.iter().all(|file| {
+                file.classes
+                    .windows(2)
+                    .all(|pair| pair[0].class_idx <= pair[1].class_idx)
+            }) =>
+        {
+            &["file_id", "class_idx"]
+        }
+        _ => return 0,
+    };
+    if !ds
+        .files
+        .windows(2)
+        .all(|pair| pair[0].file_id < pair[1].file_id)
+    {
+        return 0;
+    }
+    order.iter().zip(keys).take_while(|(entry, key)| {
+        if entry.options.sort == Some(sqlparser::ast::OrderBySort::Desc) || entry.with_fill.is_some() { return false; }
+        let mut expr = &entry.expr;
+        if let Expr::Value(value) = expr {
+            if let sqlparser::ast::Value::Number(value, _) = &value.value {
+                if let Some(item) = value.parse::<usize>().ok().and_then(|index| select.projection.get(index.wrapping_sub(1))) {
+                    if let Some(value) = item_expr(item) { expr = value; }
+                }
+            }
+        } else if let Expr::Identifier(name) = expr {
+            if let Some(SelectItem::ExprWithAlias { expr: value, .. }) = select.projection.iter().find(|item| matches!(item,SelectItem::ExprWithAlias { alias, .. } if alias.value.eq_ignore_ascii_case(&name.value))) {
+                expr = value;
+            }
+        }
+        match expr {
+            Expr::Identifier(name) => name.value.eq_ignore_ascii_case(key),
+            Expr::CompoundIdentifier(parts) => parts.len() == 2 && parts[0].value.eq_ignore_ascii_case(alias) && parts[1].value.eq_ignore_ascii_case(key),
+            _ => false,
+        }
+    }).count()
 }
 
 fn execute_with_input(
@@ -448,6 +542,7 @@ fn execute_with_input(
     schema: &[String],
     alias: &str,
     cli_limit: Option<u64>,
+    input_order_prefix: usize,
     visit_input: impl FnOnce(
         &[String],
         &mut dyn FnMut(&RelRow) -> Result<bool, String>,
@@ -482,6 +577,11 @@ fn execute_with_input(
                 if !alias.is_empty() && *options == Default::default() =>
             {
                 for column in schema {
+                    if factor_table_name(&select.from[0].relation).as_deref() == Some("classes")
+                        && matches!(column.as_str(), "field_count" | "method_count")
+                    {
+                        continue;
+                    }
                     projection.push((
                         Expr::Identifier(sqlparser::ast::Ident::new(column)),
                         column.clone(),
@@ -496,6 +596,11 @@ fn execute_with_input(
                 && name.to_string().eq_ignore_ascii_case(alias) =>
             {
                 for column in schema {
+                    if factor_table_name(&select.from[0].relation).as_deref() == Some("classes")
+                        && matches!(column.as_str(), "field_count" | "method_count")
+                    {
+                        continue;
+                    }
                     projection.push((
                         Expr::Identifier(sqlparser::ast::Ident::new(column)),
                         column.clone(),
@@ -525,6 +630,7 @@ fn execute_with_input(
     };
     let mut specs = Vec::new();
     let mut needed = HashSet::new();
+    resolve_group_refs(&mut group_exprs, &select.projection, schema);
     for expr in selection.iter_mut().chain(group_exprs.iter_mut()) {
         rewrite(expr, alias, &mut specs, &mut needed, false)?;
     }
@@ -577,7 +683,7 @@ fn execute_with_input(
         .collect::<Vec<_>>();
     // SQL OFFSET is applied by the caller; retain the first offset + limit
     // projected rows only when there is no ordering/grouping/distinct step.
-    let bound = if !grouped && query.order_by.is_none() {
+    let bound = if !grouped && (query.order_by.is_none() || input_order_prefix == orders.len()) {
         let offset = query_offset_value(query.limit_clause.as_ref()).unwrap_or(0);
         match (query_limit_value(query.limit_clause.as_ref()), cli_limit) {
             (Some(sql), Some(cli)) => Some(offset.saturating_add(sql.min(cli as usize))),
@@ -612,14 +718,83 @@ fn execute_with_input(
             _ => None,
         })
         .unwrap_or_default();
+    // Projection aliases are a logical substitution. Resolve them once so
+    // ORDER BY/HAVING do not need to clone the entire source-row map on each
+    // candidate. Retain direct projection positions to reuse computed keys.
+    let resolve_aliases = |expr: &Expr| {
+        let mut expr = expr.clone();
+        let _ = walk(&mut expr, &mut |node| {
+            if let Expr::Identifier(name) = node {
+                if let Some((value, _)) = projection
+                    .iter()
+                    .find(|(_, label)| label.eq_ignore_ascii_case(&name.value))
+                {
+                    *node = value.clone();
+                    return Some(true);
+                }
+            }
+            Some(false)
+        });
+        expr
+    };
+    let prepared_selection = selection.as_ref().map(Prepared::new);
+    let prepared_group = group_exprs.iter().map(Prepared::new).collect::<Vec<_>>();
+    let prepared_projection = projection
+        .iter()
+        .map(|(expr, _)| Prepared::new(expr))
+        .collect::<Vec<_>>();
+    let prepared_having = having
+        .as_ref()
+        .map(|expr| Prepared::new(&resolve_aliases(expr)));
+    let projection_keys = projection
+        .iter()
+        .map(|(expr, _)| expr.to_string())
+        .collect::<Vec<_>>();
+    let prepared_orders = orders
+        .iter()
+        .map(|expr| {
+            let expr = resolve_aliases(expr);
+            let position = if let Expr::Value(value) = &expr {
+                if let sqlparser::ast::Value::Number(value, _) = &value.value {
+                    value
+                        .parse::<usize>()
+                        .ok()
+                        .map(|index| index.wrapping_sub(1))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let position = position.or_else(|| {
+                let key = expr.to_string();
+                projection_keys.iter().position(|value| *value == key)
+            });
+            (position, Prepared::new(&expr))
+        })
+        .collect::<Vec<_>>();
+    for spec in &mut specs {
+        spec.prepared_argument = spec.argument.as_ref().map(Prepared::new);
+    }
+    let prefix_exprs = prepared_orders
+        .iter()
+        .take(input_order_prefix)
+        .map(|(position, expr)| {
+            position
+                .and_then(|index| prepared_projection.get(index))
+                .unwrap_or(expr)
+                .clone()
+        })
+        .collect::<Vec<_>>();
     Some((|| {
         let mut output = Vec::new();
-        let mut seen = HashSet::new();
-        let mut groups: HashMap<Vec<membership::Key>, Group> = HashMap::new();
+        let mut seen = rustc_hash::FxHashSet::default();
+        let mut groups: FxHashMap<membership::KeyTuple, Group> = FxHashMap::default();
         let mut aggregate_payload_bytes = 0u64;
+        let mut last_prefix: Option<Vec<Scalar>> = None;
         if grouped && group_exprs.is_empty() {
             groups.insert(
-                Vec::new(),
+                membership::KeyTuple::Empty,
                 Group {
                     values: Vec::new(),
                     states: specs.iter().map(State::new).collect(),
@@ -627,48 +802,28 @@ fn execute_with_input(
             );
         }
         let mut emit = |row: &RelRow, output: &mut Vec<ProjectedRow>| -> Result<(), String> {
-            let values = projection
+            let values = prepared_projection
                 .iter()
-                .map(|(expr, _)| eval_scalar(expr, row, &[]))
+                .map(|expr| expr.evaluate(row))
                 .collect::<Result<Vec<_>, _>>()?;
             if select.distinct.is_some()
                 && !seen.insert(values.iter().map(membership::set_key).collect::<Vec<_>>())
             {
                 return Ok(());
             }
-            let mut context = if orders.is_empty() && having.is_none() {
-                RelRow::default()
-            } else {
-                row.clone()
-            };
-            if !orders.is_empty() || having.is_some() {
-                for ((_, label), value) in projection.iter().zip(&values) {
-                    context.values.insert(
-                        intern_rel_component(&label.to_ascii_lowercase()),
-                        value.clone(),
-                    );
-                }
-            }
-            if having
+            if prepared_having
                 .as_ref()
-                .is_some_and(|expr| !eval_bool(expr, &context, &[]).unwrap_or(false))
+                .is_some_and(|expr| !expr.evaluate(row).is_ok_and(|value| value.truthy()))
             {
                 return Ok(());
             }
-            let keys = orders
+            let keys = prepared_orders
                 .iter()
-                .map(|expr| {
-                    if let Expr::Value(value) = expr {
-                        if let sqlparser::ast::Value::Number(value, _) = &value.value {
-                            if let Ok(index) = value.parse::<usize>() {
-                                return values
-                                    .get(index.wrapping_sub(1))
-                                    .cloned()
-                                    .unwrap_or(Scalar::Null);
-                            }
-                        }
-                    }
-                    eval_scalar(expr, &context, &[]).unwrap_or(Scalar::Null)
+                .map(|(position, expr)| {
+                    position.map_or_else(
+                        || expr.evaluate(row).unwrap_or(Scalar::Null),
+                        |index| values.get(index).cloned().unwrap_or(Scalar::Null),
+                    )
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice();
@@ -707,19 +862,36 @@ fn execute_with_input(
         };
         if bound != Some(0) {
             visit_input(&requested, &mut |row| {
-                if selection
+                if prepared_selection
                     .as_ref()
-                    .is_some_and(|expr| !eval_bool(expr, row, &[]).unwrap_or(false))
+                    .is_some_and(|expr| !expr.evaluate(row).is_ok_and(|value| value.truthy()))
                 {
                     return Ok(false);
                 }
-                if grouped {
-                    let key = group_exprs
+                if !grouped && !prefix_exprs.is_empty() {
+                    let prefix = prefix_exprs
                         .iter()
-                        .map(|expr| {
-                            eval_scalar(expr, row, &[]).map(|value| membership::set_key(&value))
-                        })
+                        .map(|expr| expr.evaluate(row))
                         .collect::<Result<Vec<_>, _>>()?;
+                    if ordered_bound.is_some_and(|bound| output.len() >= bound)
+                        && last_prefix.as_ref().is_some_and(|last| {
+                            prefix
+                                .iter()
+                                .zip(last)
+                                .any(|(a, b)| !compare_scalar(a, b).is_eq())
+                        })
+                    {
+                        return Ok(true);
+                    }
+                    last_prefix = Some(prefix);
+                }
+                if grouped {
+                    let key =
+                        membership::KeyTuple::from_results(prepared_group.iter().map(|expr| {
+                            expr.evaluate(row)
+                                .map(|value| Some(membership::set_key(&value)))
+                        }))?
+                        .expect("group keys retain SQL NULLs");
                     let group = groups.entry(key).or_insert_with(|| Group {
                         values: requested
                             .iter()
@@ -799,6 +971,20 @@ pub(super) enum Source<'a> {
     FieldAccess(&'a dexsql_cache::MethodFieldRef),
     Type(&'a dexsql_cache::MethodTypeRef),
     Number(&'a dexsql_cache::MethodNumberRef),
+}
+
+impl Source<'_> {
+    pub(super) fn method_index(self) -> Option<u32> {
+        Some(match self {
+            Self::Method(index) => index,
+            Self::String(row) => row.method_idx,
+            Self::Call(row) => row.method_idx,
+            Self::FieldAccess(row) => row.method_idx,
+            Self::Type(row) => row.method_idx,
+            Self::Number(row) => row.method_idx,
+            _ => return None,
+        })
+    }
 }
 
 pub(super) struct Cells<'a> {
@@ -893,6 +1079,16 @@ impl<'a> Cells<'a> {
             definitions,
         }
     }
+    /// Decode borrowed records without retaining another full string or
+    /// descriptor pool. Fused joins cache only the current method's cells.
+    pub(super) fn uncached(file: &'a DexFile, needs_definitions: bool, columns: &[&str]) -> Self {
+        let mut cells = Self::new(file, "fused", needs_definitions, columns);
+        cells.strings.clear();
+        cells.methods.clear();
+        cells.fields.clear();
+        cells
+    }
+
     fn string(&mut self, index: u32) -> Scalar {
         let Some(slot) = self.strings.get_mut(index as usize) else {
             return Scalar::text(self.file.string(index));
@@ -1249,21 +1445,106 @@ pub(super) fn visit_source(
     predicates: Option<&[PushPredicate]>,
     mut visit: impl FnMut(&RelRow) -> Result<bool, String>,
 ) -> Result<(), String> {
-    visit_source_records(ds, table, alias, columns, predicates, |row, _, _| {
-        visit(row)
-    })
+    visit_source_filtered(ds, table, alias, columns, predicates, None, visit)
 }
 
-/// Expose the borrowed cache record alongside its reduced row. Join build
-/// sides retain this record identity, then decode output cells only on match.
+fn visit_source_filtered(
+    ds: &Dataset,
+    table: &str,
+    alias: &str,
+    columns: &[&str],
+    predicates: Option<&[PushPredicate]>,
+    filter: Option<&Prepared>,
+    mut visit: impl FnMut(&RelRow) -> Result<bool, String>,
+) -> Result<(), String> {
+    visit_source_records_filtered(
+        ds,
+        table,
+        alias,
+        columns,
+        predicates,
+        filter,
+        |row, _, _| visit(row),
+    )
+}
+
 pub(super) fn visit_source_records<'a>(
     ds: &'a Dataset,
     table: &str,
     alias: &str,
     columns: &[&str],
     predicates: Option<&[PushPredicate]>,
+    visit: impl FnMut(&RelRow, usize, Source<'a>) -> Result<bool, String>,
+) -> Result<(), String> {
+    visit_source_records_filtered(ds, table, alias, columns, predicates, None, visit)
+}
+
+fn source_matches(
+    filter: Option<&Prepared>,
+    cells: &mut Cells<'_>,
+    source: Source<'_>,
+    opcode: Option<&(usize, String)>,
+) -> bool {
+    filter.is_none_or(|filter| {
+        filter
+            .evaluate_with(
+                &mut |name| {
+                    Ok(cells.value(
+                        source,
+                        name.split_once('.').map_or(name, |(_, column)| column),
+                        opcode,
+                    ))
+                },
+                &RelRow::default(),
+            )
+            .is_ok_and(|value| value.truthy())
+    })
+}
+
+/// Bind the fixed schema once. A stream changes cell values, never its map
+/// keys; rebuilding/interning qualified keys for every row made narrow scans
+/// spend more time on row bookkeeping than on SQL expressions.
+struct RowLayout {
+    keys: Vec<(Arc<str>, Arc<str>)>,
+}
+impl RowLayout {
+    fn new(alias: &str, columns: &[&str]) -> (Self, RelRow) {
+        let mut row = RelRow::with_capacity(columns.len());
+        let keys = columns
+            .iter()
+            .map(|column| {
+                row.put(alias, column, Scalar::Null);
+                let plain = intern_rel_component(&column.to_ascii_lowercase());
+                let qualified = intern_rel_qualified(
+                    intern_rel_component(&alias.to_ascii_lowercase()),
+                    plain.clone(),
+                );
+                (plain, qualified)
+            })
+            .collect();
+        (Self { keys }, row)
+    }
+    fn set(&self, row: &mut RelRow, index: usize, value: Scalar) {
+        let (plain, qualified) = &self.keys[index];
+        *row.values.get_mut(qualified).expect("bound qualified cell") = value.clone();
+        *row.values.get_mut(plain).expect("bound unqualified cell") = value;
+    }
+}
+
+/// Expose the borrowed cache record alongside its reduced row. Join build
+/// sides retain this record identity, then decode output cells only on match.
+fn visit_source_records_filtered<'a>(
+    ds: &'a Dataset,
+    table: &str,
+    alias: &str,
+    columns: &[&str],
+    predicates: Option<&[PushPredicate]>,
+    filter: Option<&Prepared>,
     mut visit: impl FnMut(&RelRow, usize, Source<'a>) -> Result<bool, String>,
 ) -> Result<(), String> {
+    if table == "method_strings" {
+        return visit_method_strings(ds, alias, columns, predicates, filter, visit);
+    }
     let needs_opcode = columns
         .iter()
         .any(|column| matches!(*column, "opcode_count" | "opcode_hex"));
@@ -1279,10 +1560,8 @@ pub(super) fn visit_source_records<'a>(
             needs_definitions && table == "methods",
             columns,
         );
-        let mut row = RelRow::with_capacity(columns.len());
+        let (layout, mut row) = RowLayout::new(alias, columns);
         let mut consume = |source| {
-            row.values.clear();
-            row.columns.clear();
             let opcode = if let Source::Method(index) = source {
                 if needs_opcode_hex {
                     file.method_opcode_summary(index)
@@ -1295,6 +1574,9 @@ pub(super) fn visit_source_records<'a>(
             } else {
                 None
             };
+            if !source_matches(filter, &mut cells, source, opcode.as_ref()) {
+                return Ok(false);
+            }
             if predicates.is_some_and(|predicates| {
                 !predicates_match(predicates, |column| {
                     cells.value(source, column, opcode.as_ref())
@@ -1302,9 +1584,9 @@ pub(super) fn visit_source_records<'a>(
             }) {
                 return Ok(false);
             }
-            for column in columns {
+            for (index, column) in columns.iter().enumerate() {
                 let value = cells.value(source, column, opcode.as_ref());
-                row.put(alias, column, value);
+                layout.set(&mut row, index, value);
             }
             visit(&row, file_index, source)
         };
@@ -1432,6 +1714,109 @@ pub(super) fn visit_source_records<'a>(
     Ok(())
 }
 
+/// Reference scans enumerate method-string edges by method id across DEXes,
+/// then by file identity, preserving each method's instruction/reference order.
+/// Merge one cursor per file; only a malformed/out-of-order local cache needs
+/// a compact ordinal permutation, never a materialized row relation.
+fn visit_method_strings<'a>(
+    ds: &'a Dataset,
+    alias: &str,
+    columns: &[&str],
+    predicates: Option<&[PushPredicate]>,
+    filter: Option<&Prepared>,
+    mut visit: impl FnMut(&RelRow, usize, Source<'a>) -> Result<bool, String>,
+) -> Result<(), String> {
+    let mut ordinals = Vec::with_capacity(ds.files.len());
+    let mut ordinal_bytes = 0u64;
+    let mut heap = BinaryHeap::new();
+    for (file_index, file) in ds.files.iter().enumerate() {
+        let order = if file
+            .method_strings
+            .windows(2)
+            .all(|rows| rows[0].method_idx <= rows[1].method_idx)
+        {
+            None
+        } else {
+            let mut order = (0..file.method_strings.len() as u32).collect::<Vec<_>>();
+            order.sort_by_key(|ordinal| file.method_strings[*ordinal as usize].method_idx);
+            ordinal_bytes += order.len() as u64 * 4;
+            charge_materialized(ordinal_bytes)?;
+            Some(order)
+        };
+        let _ = file_index;
+        ordinals.push(order);
+    }
+    // Cursors interleave files, so a dense memo per file would retain every
+    // string/method pool at once. The reusable row owns only its current cells;
+    // descriptor/string accessors already support direct uncached decoding.
+    let mut cells = ds
+        .files
+        .iter()
+        .map(|file| Cells {
+            file,
+            strings: Default::default(),
+            methods: Vec::new(),
+            fields: Vec::new(),
+            definitions: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    // Apply row-local filters inside each sorted cursor. Only surviving edges
+    // enter the k-way merge heap, so a sparse predicate does not pay pop/push
+    // bookkeeping for every reference in the APK. Source order is unchanged.
+    let advance = |file_index: usize, mut position: usize, cells: &mut Cells<'_>| {
+        let file = &ds.files[file_index];
+        while position < file.method_strings.len() {
+            let ordinal = ordinals[file_index]
+                .as_ref()
+                .map_or(position, |order| order[position] as usize);
+            let source = Source::String(&file.method_strings[ordinal]);
+            if source_matches(filter, cells, source, None)
+                && !predicates.is_some_and(|predicates| {
+                    !predicates_match(predicates, |column| cells.value(source, column, None))
+                })
+            {
+                return Some((position, ordinal));
+            }
+            position += 1;
+        }
+        None
+    };
+    for (file_index, file) in ds.files.iter().enumerate() {
+        if let Some((position, ordinal)) = advance(file_index, 0, &mut cells[file_index]) {
+            heap.push(std::cmp::Reverse((
+                file.method_strings[ordinal].method_idx,
+                file.file_id,
+                file_index,
+                position,
+            )));
+        }
+    }
+    let (layout, mut row) = RowLayout::new(alias, columns);
+    while let Some(std::cmp::Reverse((_, _, file_index, position))) = heap.pop() {
+        let file = &ds.files[file_index];
+        let ordinal = ordinals[file_index]
+            .as_ref()
+            .map_or(position, |order| order[position] as usize);
+        let source = Source::String(&file.method_strings[ordinal]);
+        let cells = &mut cells[file_index];
+        for (index, column) in columns.iter().enumerate() {
+            layout.set(&mut row, index, cells.value(source, column, None));
+        }
+        if visit(&row, file_index, source)? {
+            return Ok(());
+        }
+        if let Some((next, ordinal)) = advance(file_index, position + 1, cells) {
+            heap.push(std::cmp::Reverse((
+                file.method_strings[ordinal].method_idx,
+                file.file_id,
+                file_index,
+                next,
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1451,6 +1836,53 @@ mod tests {
             panic!()
         };
         *query
+    }
+    #[test]
+    fn ordered_prefix_topk_preserves_distinct_offsets_aliases_and_unsorted_sources() {
+        let mut ds = fixture();
+        for reverse_files in [false, true] {
+            if reverse_files {
+                ds.files.reverse();
+            }
+            for projection in [
+                "file_id,length(name),param_count",
+                "file_id AS f,length(name) AS n,param_count AS p",
+            ] {
+                let keys = if projection.contains(" AS ") {
+                    "f,n DESC,p"
+                } else {
+                    "file_id,length(name) DESC,param_count"
+                };
+                for distinct in ["", "DISTINCT "] {
+                    for (limit, offset) in [(1, 0), (3, 1), (50, 0)] {
+                        let sql = format!("SELECT {distinct}{projection} FROM methods ORDER BY {keys} LIMIT {limit} OFFSET {offset}");
+                        let query = parse(&sql);
+                        let select = query.body.as_select().unwrap();
+                        let mut actual =
+                            execute(&query, select, &ds, &NamedCaches::default(), None)
+                                .unwrap()
+                                .unwrap();
+                        let mut expected = execute_select_core(
+                            select,
+                            &ds,
+                            Some(&ds),
+                            &NamedCaches::default(),
+                            false,
+                            None,
+                            None,
+                        )
+                        .unwrap();
+                        apply_query_order_limit(&mut actual, &query, None).unwrap();
+                        apply_query_order_limit(&mut expected, &query, None).unwrap();
+                        assert_eq!(
+                            render(actual),
+                            render(expected),
+                            "{sql} reverse={reverse_files}"
+                        );
+                    }
+                }
+            }
+        }
     }
     #[test]
     fn streaming_matches_generic_relations_and_aggregates() {
