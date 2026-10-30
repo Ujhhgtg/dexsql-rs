@@ -48,7 +48,36 @@ impl StringPool {
             pool: self,
             front: 0,
             back: self.len(),
+            front_start: 0,
         }
+    }
+
+    /// IDs of the strings that contain `needle` (which must be non-empty).
+    ///
+    /// One pass over the packed arena is far cheaper than slicing every string
+    /// for a substring predicate: the search is a SIMD byte scan, and matches
+    /// are mapped back to their owning ID through the end offsets. A match
+    /// crossing two adjacent IDs is rejected because it is not a substring of
+    /// either one.
+    pub fn indices_containing(&self, needle: &str) -> Vec<u32> {
+        debug_assert!(!needle.is_empty());
+        let mut indices = Vec::new();
+        let mut previous = None;
+        for position in memchr::memmem::find_iter(&self.bytes, needle.as_bytes()) {
+            let index = self.ends.partition_point(|&end| end as usize <= position);
+            let Some(&end) = self.ends.get(index) else {
+                continue;
+            };
+            if position + needle.len() > end as usize {
+                continue;
+            }
+            let index = index as u32;
+            if previous != Some(index) {
+                indices.push(index);
+                previous = Some(index);
+            }
+        }
+        indices
     }
 
     /// Match slice binary-search behavior, retaining the caller's ordering.
@@ -135,6 +164,9 @@ pub struct Iter<'a> {
     pool: &'a StringPool,
     front: usize,
     back: usize,
+    /// Start byte of the next front item; tracked so forward iteration reads
+    /// one offset per item instead of reloading the previous end.
+    front_start: usize,
 }
 
 impl<'a> Iterator for Iter<'a> {
@@ -144,9 +176,11 @@ impl<'a> Iterator for Iter<'a> {
         if self.front == self.back {
             return None;
         }
-        let index = self.front;
+        let end = self.pool.ends[self.front] as usize;
+        let item = &self.pool.bytes[self.front_start..end];
+        self.front_start = end;
         self.front += 1;
-        self.pool.get(index)
+        Some(unsafe { std::str::from_utf8_unchecked(item) })
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -263,5 +297,29 @@ mod tests {
         assert_eq!(crate::dex::utf16_cmp(&pool[0], &pool[1]), Ordering::Less);
         assert_eq!(crate::dex::utf16_cmp(&pool[1], &pool[2]), Ordering::Less);
         assert_eq!(pool[0].cmp(&pool[1]), Ordering::Greater);
+    }
+
+    #[test]
+    fn indices_containing_reports_substrings_without_crossing_ids() {
+        let pool = StringPool::from(
+            vec!["abc", "", "bcde", "xxbcxx", "b", "c", "你好世界"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(pool.indices_containing("bc"), vec![0, 2, 3]);
+        assert_eq!(pool.indices_containing("c"), vec![0, 2, 3, 5]);
+        assert_eq!(pool.indices_containing("你好"), vec![6]);
+
+        // The needle's bytes occur at the junction between two adjacent IDs,
+        // where it is not a substring of either one.
+        let pool = StringPool::from(vec!["ab".to_owned(), "cd".to_owned()]);
+        assert_eq!(pool.indices_containing("bc"), Vec::<u32>::new());
+        assert_eq!(pool.indices_containing("b"), vec![0]);
+        assert_eq!(pool.indices_containing("cd"), vec![1]);
+
+        // A short needle may match many times inside one ID but is reported once.
+        let pool = StringPool::from(vec!["aaaa".to_owned()]);
+        assert_eq!(pool.indices_containing("aa"), vec![0]);
     }
 }

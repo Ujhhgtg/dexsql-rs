@@ -1079,6 +1079,16 @@ fn string_candidate_methods(file: &DexFile, need: &StringNeed) -> HashSet<u32> {
         }
         return out;
     }
+    if need.mode == LikeMode::Contains && !need.case_insensitive && !need.value.is_empty() {
+        // Substring predicates are answered by one arena scan instead of
+        // slicing every pool entry; only referenced strings contribute rows.
+        for string_idx in file.strings.indices_containing(&need.value) {
+            if let Some(methods) = file.string_reference_index().get(&string_idx) {
+                out.extend(methods.iter().copied());
+            }
+        }
+        return out;
+    }
     for (string_idx, value) in file.strings.iter().enumerate() {
         if !plain_like_match(value, need) {
             continue;

@@ -284,6 +284,10 @@ pub struct DexFile {
     /// String-pool ranks under the UTF-16 text order: `rank[s]` is the
     /// position of string s among the sorted pool.
     pub string_utf16_ranks: Arc<OnceLock<Vec<u32>>>,
+    /// Whether the packed string ids are ordered by UTF-16 code units, which
+    /// the DEX format guarantees and literal binary searches rely on. Decoded
+    /// lazily: only literal lookups need the ordering guarantee.
+    pub strings_utf16_sorted: Arc<OnceLock<bool>>,
     /// Indices into `classes` ordered by ascending `class_idx`; the
     /// class-data relations report rows in this order (not class_def order).
     pub classes_by_idx_order: Vec<u32>,
@@ -392,12 +396,7 @@ impl DexFile {
             // Well-formed DEX files sort string_ids by UTF-16 code units, so
             // the identity is the rank map; only fall back to a full sort for
             // inputs that violate the spec.
-            let sorted = self
-                .strings
-                .iter()
-                .zip(self.strings.iter().skip(1))
-                .all(|(left, right)| utf16_cmp(left, right) != std::cmp::Ordering::Greater);
-            if sorted {
+            if self.strings_sorted_by_utf16() {
                 return (0..self.strings.len() as u32).collect();
             }
             let mut order: Vec<u32> = (0..self.strings.len() as u32).collect();
@@ -450,20 +449,38 @@ impl DexFile {
     }
 
     /// Resolve a string-pool value without allocating a second `String` for
-    /// every DEX string.  DEX string ids are sorted, so the common path is a
-    /// binary search; the linear fallback preserves correctness for pools
-    /// whose UTF-16 ordering differs from Rust scalar ordering.
+    /// every DEX string.
+    ///
+    /// DEX string ids are ordered by UTF-16 code units, so the lookup compares
+    /// in that order (Rust's byte order differs for supplementary characters).
+    /// An exact scan is kept only for pools that violate the DEX ordering
+    /// guarantee; running it after every missed binary search made each absent
+    /// literal rescan the whole pool.
     pub fn find_string_idx(&self, value: &str) -> Option<u32> {
+        if !self.strings_sorted_by_utf16() {
+            return self
+                .strings
+                .iter()
+                .position(|item| item == value)
+                .map(|idx| idx as u32);
+        }
         self.strings
-            .binary_search_by(|item| item.cmp(value))
+            .binary_search_by(|item| utf16_cmp(item, value))
             .ok()
             .map(|idx| idx as u32)
-            .or_else(|| {
-                self.strings
-                    .iter()
-                    .position(|item| item == value)
-                    .map(|idx| idx as u32)
-            })
+    }
+
+    /// Whether the packed string ids follow the DEX's UTF-16 code-unit order.
+    ///
+    /// The check is memoized: it turns every literal lookup after the first
+    /// into a binary search while still detecting non-conforming inputs.
+    fn strings_sorted_by_utf16(&self) -> bool {
+        *self.strings_utf16_sorted.get_or_init(|| {
+            self.strings
+                .iter()
+                .zip(self.strings.iter().skip(1))
+                .all(|(left, right)| utf16_cmp(left, right) != std::cmp::Ordering::Greater)
+        })
     }
 
     pub fn type_descriptor(&self, idx: u32) -> &str {
@@ -2177,6 +2194,7 @@ impl Dataset {
             classes: Vec::new(),
             method_descriptor_order: Arc::new(OnceLock::new()),
             string_utf16_ranks: Arc::new(OnceLock::new()),
+            strings_utf16_sorted: Arc::new(OnceLock::new()),
             classes_by_idx_order: Vec::new(),
             classes_by_superclass: Arc::new(OnceLock::new()),
             classes_by_descriptor: Arc::new(OnceLock::new()),
@@ -2352,6 +2370,7 @@ impl Dataset {
             classes: Vec::new(),
             method_descriptor_order: Arc::new(OnceLock::new()),
             string_utf16_ranks: Arc::new(OnceLock::new()),
+            strings_utf16_sorted: Arc::new(OnceLock::new()),
             classes_by_idx_order: Vec::new(),
             classes_by_superclass: Arc::new(OnceLock::new()),
             classes_by_descriptor: Arc::new(OnceLock::new()),
@@ -4632,6 +4651,7 @@ fn parse_dex(
         byte_len: raw_bytes.len() as u64,
         method_descriptor_order: Arc::new(OnceLock::new()),
         string_utf16_ranks: Arc::new(OnceLock::new()),
+        strings_utf16_sorted: Arc::new(OnceLock::new()),
         classes_by_idx_order: {
             let mut order: Vec<u32> = (0..classes.len() as u32).collect();
             order.sort_by_key(|&index| classes[index as usize].class_idx);
@@ -6142,18 +6162,121 @@ mod tests {
 /// Lexicographic UTF-16 code-unit comparison: the dialect's text order for
 /// sorting (differs from UTF-8 byte order for supplementary characters).
 pub fn utf16_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    let common = a_bytes.len().min(b_bytes.len());
+    let mut index = 0;
+    while index < common {
+        let left = a_bytes[index];
+        let right = b_bytes[index];
+        if left == right {
+            index += 1;
+            continue;
+        }
+        if left < 0x80 && right < 0x80 {
+            // Two ASCII scalars compare identically in UTF-8 and UTF-16.
+            return left.cmp(&right);
+        }
+        break;
+    }
+    if index == common {
+        // The shared byte prefix is also a shared UTF-16 prefix.
+        return a_bytes.len().cmp(&b_bytes.len());
+    }
     let mut a = a.encode_utf16();
     let mut b = b.encode_utf16();
     loop {
         match (a.next(), b.next()) {
-            (None, None) => return std::cmp::Ordering::Equal,
-            (None, Some(_)) => return std::cmp::Ordering::Less,
-            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
             (Some(x), Some(y)) => {
                 if x != y {
                     return x.cmp(&y);
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod utf16_and_lookup_tests {
+    use super::{utf16_cmp, Dataset, IndexNeeds};
+    use std::path::PathBuf;
+
+    /// Reference UTF-16 code-unit comparison; `utf16_cmp` adds an ASCII fast
+    /// path on top of this exact ordering.
+    fn slow_utf16_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+        let mut a = a.encode_utf16();
+        let mut b = b.encode_utf16();
+        loop {
+            match (a.next(), b.next()) {
+                (None, None) => return std::cmp::Ordering::Equal,
+                (None, Some(_)) => return std::cmp::Ordering::Less,
+                (Some(_), None) => return std::cmp::Ordering::Greater,
+                (Some(x), Some(y)) if x != y => return x.cmp(&y),
+                (Some(_), Some(_)) => {}
+            }
+        }
+    }
+
+    #[test]
+    fn utf16_cmp_fast_path_matches_code_unit_order() {
+        let samples = [
+            "",
+            "\u{0}",
+            "a",
+            "A",
+            "ab",
+            "abc",
+            "abd",
+            "z",
+            "你好",
+            "你好世界",
+            "\u{d7ff}",
+            "\u{e000}",
+            "\u{ffff}",
+            "\u{fffd}",
+            "\u{10000}",
+            "\u{10ffff}",
+            "😀",
+            "😀z",
+            "z😀",
+            "a😀b",
+            "a\u{e000}b",
+            "\u{10000}\u{e000}",
+        ];
+        for left in samples {
+            for right in samples {
+                assert_eq!(
+                    utf16_cmp(left, right),
+                    slow_utf16_cmp(left, right),
+                    "{left:?} vs {right:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn find_string_idx_resolves_every_pool_string() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../fixtures/dex/alpha.dex");
+        let dataset =
+            Dataset::load_paths_with_requirements(&[path], IndexNeeds::all(), true, true, true)
+                .expect("fixture DEX should load");
+        let file = &dataset.files[0];
+        assert!(!file.strings.is_empty());
+        assert!(file.strings_sorted_by_utf16());
+        for index in 0..file.strings.len() {
+            let value = &file.strings[index];
+            let found = file
+                .find_string_idx(value)
+                .unwrap_or_else(|| panic!("string id {index} ({value:?}) must resolve"));
+            assert_eq!(&file.strings[found as usize], value);
+        }
+        assert_eq!(
+            file.find_string_idx("literal absent from the fixture"),
+            None
+        );
     }
 }
