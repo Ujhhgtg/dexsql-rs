@@ -10,8 +10,18 @@ use std::collections::{HashMap, HashSet};
 use sqlparser::ast::{
     BinaryOperator, Expr, GroupByExpr, Query, Select, SelectItem, SetExpr, Statement,
 };
-use sqlparser::dialect::SQLiteDialect;
-use sqlparser::parser::Parser;
+
+/// Parse through the native recursive-descent front-end before constructing
+/// the compatibility AST required by the legacy diagnostics walkers.
+/// This keeps diagnostics from accepting syntax that the reference parser
+/// rejects while the compatibility walkers are migrated incrementally.
+fn parse_compat(
+    sql: &str,
+) -> Result<Vec<sqlparser::ast::Statement>, sqlparser::parser::ParserError> {
+    let query =
+        super::typed::parse_compat(sql).map_err(sqlparser::parser::ParserError::TokenizerError)?;
+    Ok(vec![sqlparser::ast::Statement::Query(query)])
+}
 
 pub(super) fn rewrite_count(sql: &str, definitions: &HashMap<String, String>) -> usize {
     count_sql(sql, definitions, &mut HashSet::new())
@@ -22,7 +32,7 @@ fn count_sql(
     definitions: &HashMap<String, String>,
     expanding: &mut HashSet<String>,
 ) -> usize {
-    let Ok(statements) = Parser::parse_sql(&SQLiteDialect {}, sql) else {
+    let Ok(statements) = parse_compat(sql) else {
         return 0;
     };
     let [Statement::Query(query)] = statements.as_slice() else {
@@ -144,7 +154,7 @@ fn count_query(
             }
             let inner = count_sql(definition, &definitions, expanding);
             expanding.remove(table);
-            let relational_definition = Parser::parse_sql(&SQLiteDialect {}, definition)
+            let relational_definition = parse_compat(definition)
                 .ok()
                 .and_then(|statements| match statements.into_iter().next()? {
                     Statement::Query(query) => Some(query.body.as_select()?.from.len() > 0),

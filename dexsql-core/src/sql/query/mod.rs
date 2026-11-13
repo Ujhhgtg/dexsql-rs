@@ -310,30 +310,18 @@ fn validate_definition_query(
             "expected exactly one SQL statement",
         ));
     }
-    let dialect = expressions::Dialect {};
-    let parsed = sqlparser::parser::Parser::parse_sql(&dialect, &statements[0]).map_err(|e| {
-        let (mapped, span) =
-            crate::sql::ast::parser::map_parser_error(&e.to_string(), &statements[0]);
-        let rendered = match span {
-            Some((start, end)) => format!("{mapped} (at bytes {start}..{end})"),
-            None => mapped,
+    let parsed = crate::sql::ast::query::parse_query(&statements[0]).map_err(|error| {
+        let rendered = match error.span {
+            Some((start, end)) => format!("{} (at bytes {start}..{end})", error.message),
+            None => error.message,
         };
         DexSqlError::from_front(crate::sql::ast::Code::InvalidInput, rendered)
     })?;
-    if parsed.len() != 1 {
-        return Err(DexSqlError::query_failed(
-            "expected exactly one SQL statement",
-        ));
-    }
     // CTE names introduced by the definition query are visible to its own
     // FROM clauses and must not be treated as external relations.
     let mut local_names = HashSet::new();
-    if let Some(sqlparser::ast::Statement::Query(query)) = parsed.first() {
-        if let Some(with) = &query.with {
-            for cte in &with.cte_tables {
-                local_names.insert(cte.alias.name.value.to_ascii_lowercase());
-            }
-        }
+    for cte in &parsed.with {
+        local_names.insert(cte.name.to_ascii_lowercase());
     }
     for name in sql_table_names(&statements[0]) {
         if local_names.contains(&name) {
@@ -543,12 +531,9 @@ fn query_load_options(sqls: &[String]) -> (IndexNeeds, bool, bool, bool, bool) {
     let mut retain_classes = false;
     let mut retain_raw_bytes = false;
     for sql in sqls {
-        let reduced_sql = sqlparser::parser::Parser::parse_sql(&expressions::Dialect {}, sql)
+        let reduced_sql = typed::parse_compat(sql)
             .ok()
-            .and_then(|statements| match statements.into_iter().next()? {
-                sqlparser::ast::Statement::Query(query) => derived::query(&query),
-                _ => None,
-            })
+            .and_then(|query| derived::query(&query))
             .map(|query| query.to_string());
         let sql = reduced_sql.as_ref().unwrap_or(sql);
         // Method lookup indexes are needed only when a methods relation is
@@ -717,18 +702,16 @@ fn query_has_projection_wildcard(sql: &str) -> bool {
     // The regular load-option matching is conservative, including subquery
     // text. Use tokens here so count(*) and '*' string literals do not make
     // otherwise metadata-only method queries retain their instruction data.
-    use sqlparser::tokenizer::{Token, Tokenizer};
-    let dialect = expressions::Dialect {};
-    let Ok(tokens) = Tokenizer::new(&dialect, sql).tokenize() else {
+    use crate::sql::ast::token::{tokenize, TokenKind};
+    let Ok(tokens) = tokenize(sql) else {
         return true;
     };
-    let significant = tokens
-        .into_iter()
-        .filter(|token| !matches!(token, Token::Whitespace(_)))
-        .collect::<Vec<_>>();
-    significant.iter().enumerate().any(|(index, token)| {
-        matches!(token, Token::Mul)
-            && !matches!(significant.get(index.wrapping_sub(1)), Some(Token::LParen))
+    tokens.iter().enumerate().any(|(index, token)| {
+        matches!(token.kind, TokenKind::Op(ref op) if op == "*")
+            && !matches!(
+                tokens.get(index.wrapping_sub(1)).map(|token| &token.kind),
+                Some(TokenKind::LParen)
+            )
     })
 }
 
@@ -800,10 +783,7 @@ fn is_sql_identifier(name: &str) -> bool {
 }
 
 fn bare_count_query(sql: &str) -> bool {
-    let Ok(statements) = sqlparser::parser::Parser::parse_sql(&expressions::Dialect {}, sql) else {
-        return false;
-    };
-    let Some(sqlparser::ast::Statement::Query(query)) = statements.first() else {
+    let Ok(query) = typed::parse_compat(sql) else {
         return false;
     };
     let Some(select) = query.body.as_select() else {
@@ -1075,11 +1055,7 @@ fn sql_table_names(sql: &str) -> Vec<String> {
     if statements.len() != 1 {
         return Vec::new();
     }
-    let dialect = expressions::Dialect {};
-    let Ok(parsed) = sqlparser::parser::Parser::parse_sql(&dialect, &statements[0]) else {
-        return Vec::new();
-    };
-    let Some(sqlparser::ast::Statement::Query(query)) = parsed.into_iter().next() else {
+    let Ok(query) = typed::parse_compat(&statements[0]) else {
         return Vec::new();
     };
     let Some(select) = query.body.as_select() else {
@@ -2024,157 +2000,25 @@ fn run_interactive(mut request: QueryRequest) -> Result<(), String> {
 fn validate_single(sql: &str) -> Result<crate::sql::ast::Statement, DexSqlError> {
     let statement = crate::sql::ast::validate(sql)
         .map_err(|error| DexSqlError::from_front(error.code, error.render()))?;
-    if let crate::sql::ast::Statement::Query { sql } = &statement {
-        if let Ok(statements) = split_statements(sql) {
-            if statements.len() == 1 {
-                let dialect = expressions::Dialect {};
-                match sqlparser::parser::Parser::parse_sql(&dialect, &statements[0]) {
-                    Err(error) => {
-                        let (mapped, span) = crate::sql::ast::parser::map_parser_error(
-                            &error.to_string(),
-                            &statements[0],
-                        );
-                        let rendered = match span {
-                            Some((start, end)) => format!("{mapped} (at bytes {start}..{end})"),
-                            None => mapped,
-                        };
-                        return Err(DexSqlError::from_front(
-                            crate::sql::ast::Code::InvalidInput,
-                            rendered,
-                        ));
-                    }
-                    Ok(parsed) => {
-                        // The reference grammar only accepts the plain
-                        // TRIM(x[, chars]) form; BOTH/LEADING/TRAILING ... FROM
-                        // spellings fail validate_sql with `expected RParen`
-                        // spanning the trim-what literal.
-                        if let Some(span) = find_trim_syntax_rejection(&parsed, &statements[0]) {
-                            let rendered = match span {
-                                Some((start, end)) => {
-                                    format!("expected RParen (at bytes {start}..{end})")
-                                }
-                                None => "expected RParen".to_owned(),
-                            };
-                            return Err(DexSqlError::from_front(
-                                crate::sql::ast::Code::InvalidInput,
-                                rendered,
-                            ));
-                        }
-                    }
-                }
-            }
-        }
+    // The reference validates query syntax with its own recursive-descent
+    // parser after the front classifier. Keep this pass independent from the
+    // execution AST bridge; malformed SQL must never be accepted merely
+    // because an external AST parser happens to accept it.
+    if let crate::sql::ast::Statement::Query { sql: query } = &statement {
+        crate::sql::ast::query::parse_query(query).map_err(|error| {
+            let rendered = match error.span {
+                Some((start, end)) => format!("{} (at bytes {start}..{end})", error.message),
+                None => error.message,
+            };
+            DexSqlError::from_front(crate::sql::ast::Code::InvalidInput, rendered)
+        })?;
     }
     Ok(statement)
 }
 
-/// Detect `TRIM([BOTH|LEADING|TRAILING] [what] FROM ...)` and return the
-/// offending span (the trim-what literal when present).
-fn find_trim_syntax_rejection(
-    statements: &[sqlparser::ast::Statement],
-    sql: &str,
-) -> Option<Option<(usize, usize)>> {
-    use sqlparser::ast::Expr;
-    let mut rejected: Option<Option<(usize, usize)>> = None;
-    let mut visit = |expr: &Expr, _visit: &mut dyn FnMut(&Expr)| {
-        if let Expr::Trim {
-            trim_where,
-            trim_what,
-            ..
-        } = expr
-        {
-            if (trim_where.is_some() || trim_what.is_some()) && rejected.is_none() {
-                let span = trim_what.as_ref().and_then(|what| expr_span(what, sql));
-                rejected = Some(span);
-            }
-        }
-    };
-    let _ = &mut visit;
-    for statement in statements {
-        if let sqlparser::ast::Statement::Query(query) = statement {
-            walk_query_exprs(query, &mut |expr| {
-                if let Expr::Trim {
-                    trim_where,
-                    trim_what,
-                    ..
-                } = expr
-                {
-                    if (trim_where.is_some() || trim_what.is_some()) && rejected.is_none() {
-                        let span = trim_what.as_ref().and_then(|what| expr_span(what, sql));
-                        rejected = Some(span);
-                    }
-                }
-            });
-        }
-    }
-    rejected
-}
-
-/// Best-effort byte span of an expression from sqlparser line/column data.
-fn expr_span(expr: &sqlparser::ast::Expr, sql: &str) -> Option<(usize, usize)> {
-    use sqlparser::ast::Expr;
-    match expr {
-        Expr::Value(value) => {
-            let start = line_column_to_offset(
-                sql,
-                value.span.start.line as usize,
-                value.span.start.column as usize,
-            );
-            let end = line_column_to_offset(
-                sql,
-                value.span.end.line as usize,
-                value.span.end.column as usize,
-            );
-            Some((start, end))
-        }
-        _ => None,
-    }
-}
-
-fn line_column_to_offset(sql: &str, line: usize, column: usize) -> usize {
-    let mut offset = 0usize;
-    for (index, text_line) in sql.split('\n').enumerate() {
-        if index + 1 == line {
-            return offset + (column.saturating_sub(1)).min(text_line.chars().count());
-        }
-        offset += text_line.len() + 1;
-    }
-    offset
-}
-
-/// Walk the expressions of a query's SELECT bodies and set operations.
-fn walk_query_exprs(query: &sqlparser::ast::Query, visit: &mut dyn FnMut(&sqlparser::ast::Expr)) {
-    walk_set_expr_exprs(query.body.as_ref(), visit);
-}
-
-fn walk_set_expr_exprs(
-    expr: &sqlparser::ast::SetExpr,
-    visit: &mut dyn FnMut(&sqlparser::ast::Expr),
-) {
-    use sqlparser::ast::SetExpr;
-    match expr {
-        SetExpr::Select(select) => {
-            for item in &select.projection {
-                if let Some(expr) = item_expr(item) {
-                    walk_expr(expr, visit);
-                }
-            }
-            if let Some(selection) = &select.selection {
-                walk_expr(selection, visit);
-            }
-            if let Some(having) = &select.having {
-                walk_expr(having, visit);
-            }
-        }
-        SetExpr::Query(query) => walk_query_exprs(query, visit),
-        SetExpr::SetOperation { left, right, .. } => {
-            walk_set_expr_exprs(left, visit);
-            walk_set_expr_exprs(right, visit);
-        }
-        _ => {}
-    }
-}
-
+/// Walk the compatibility AST for planner diagnostics while the execution
+/// AST migration is in progress. Parsing itself no longer depends on this
+/// walker; it only visits the already-lowered compatibility nodes.
 fn walk_expr(expr: &sqlparser::ast::Expr, visit: &mut dyn FnMut(&sqlparser::ast::Expr)) {
     use sqlparser::ast::Expr;
     visit(expr);
@@ -2198,6 +2042,17 @@ fn walk_expr(expr: &sqlparser::ast::Expr, visit: &mut dyn FnMut(&sqlparser::ast:
         }
         _ => {}
     }
+}
+
+fn line_column_to_offset(sql: &str, line: usize, column: usize) -> usize {
+    let mut offset = 0usize;
+    for (index, text_line) in sql.split('\n').enumerate() {
+        if index + 1 == line {
+            return offset + (column.saturating_sub(1)).min(text_line.chars().count());
+        }
+        offset += text_line.len() + 1;
+    }
+    offset
 }
 
 fn run_interactive_batch(
@@ -2557,19 +2412,8 @@ pub fn execute_statement(
             return Ok(result);
         }
     }
-    let dialect = expressions::Dialect {};
-    let statements = sqlparser::parser::Parser::parse_sql(&dialect, normalized)
-        .map_err(|e| format!("SQL parse error: {e}"))?;
-    if statements.len() != 1 {
-        return Err(format!(
-            "expected one SQL statement, found {}",
-            statements.len()
-        ));
-    }
-    let statement = statements.into_iter().next().unwrap();
-    let sqlparser::ast::Statement::Query(mut query) = statement else {
-        return Err("only read-only SELECT statements are supported".into());
-    };
+    let mut query =
+        typed::parse_compat(normalized).map_err(|error| format!("SQL parse error: {error}"))?;
     lower_substring_calls(&mut query, normalized);
     lower_blob_literals(&mut query, normalized);
     if dataset.is_none() {
@@ -12104,14 +11948,7 @@ mod fallback_reference_scan_tests {
                 rows: vec![vec![Scalar::Int(1)]; 128],
             }),
         );
-        let statements = sqlparser::parser::Parser::parse_sql(
-            &expressions::Dialect {},
-            "SELECT l.payload FROM left_rows l, right_rows r",
-        )
-        .unwrap();
-        let sqlparser::ast::Statement::Query(query) = &statements[0] else {
-            unreachable!()
-        };
+        let query = typed::parse_compat("SELECT l.payload FROM left_rows l, right_rows r").unwrap();
         let result = execute_select_core(
             query.body.as_select().unwrap(),
             &Dataset::default(),

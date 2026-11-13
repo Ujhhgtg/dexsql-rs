@@ -4,13 +4,12 @@
 //! contains named table/raw-edge leaves and textual scalar expressions; the
 //! optimizer can rewrite those nodes before a resolver attaches physical slots.
 
+use crate::sql::ast::query as native;
 use crate::sql::ir::{PlanNode, ScanKind, Schema};
 use sqlparser::ast::{
     Expr, GroupByExpr, JoinConstraint, JoinOperator, LimitClause, Query, Select, SelectItem,
     SetExpr, Statement, TableFactor, TableWithJoins,
 };
-use sqlparser::dialect::SQLiteDialect;
-use sqlparser::parser::Parser;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LowerError(pub String);
@@ -25,15 +24,315 @@ impl std::error::Error for LowerError {}
 
 /// Parse and lower exactly one read-only SELECT statement.
 pub fn lower_sql(sql: &str) -> Result<PlanNode, LowerError> {
-    let statements = Parser::parse_sql(&SQLiteDialect {}, sql)
-        .map_err(|error| LowerError(format!("SQL parse error: {error}")))?;
-    if statements.len() != 1 {
-        return Err(LowerError(format!(
-            "expected one SQL statement, found {}",
-            statements.len()
-        )));
+    let query = native::parse_query(sql).map_err(|error| LowerError(render_native_error(error)))?;
+    lower_native_query(&query)
+}
+
+fn render_native_error(error: native::ParseError) -> String {
+    match error.span {
+        Some((start, end)) => format!(
+            "SQL parse error: {} (at bytes {start}..{end})",
+            error.message
+        ),
+        None => format!("SQL parse error: {}", error.message),
     }
-    lower_statement(&statements[0])
+}
+
+fn lower_native_query(query: &native::Query) -> Result<PlanNode, LowerError> {
+    let mut plan = match &query.body {
+        native::SetExpr::Select(select) => lower_native_select(select)?,
+        native::SetExpr::Values(_) => {
+            return Err(LowerError("VALUES are parsed by the native front-end but are not represented by this scan IR yet".into()))
+        }
+        native::SetExpr::SetOp { .. } => {
+            return Err(LowerError("set operations are parsed by the native front-end but are not represented by this scan IR yet".into()))
+        }
+    };
+    if !query.order_by.is_empty() {
+        plan = PlanNode::Sort {
+            input: Box::new(plan),
+            keys: query
+                .order_by
+                .iter()
+                .map(|order| native_expr_text(&order.expr))
+                .collect(),
+        };
+    }
+    if let Some(limit) = &query.limit {
+        let limit = native_limit(limit, "LIMIT")?;
+        let offset = query
+            .offset
+            .as_ref()
+            .map_or(Ok(0), |expr| native_limit(expr, "OFFSET"))?;
+        plan = PlanNode::Limit {
+            input: Box::new(plan),
+            limit,
+            offset,
+        };
+    }
+    Ok(plan)
+}
+
+fn native_limit(expr: &native::Expr, name: &str) -> Result<usize, LowerError> {
+    let native::Expr::Literal(native::Literal::Number(value)) = expr else {
+        return Err(LowerError(format!("{name} must be a numeric literal")));
+    };
+    value
+        .parse::<usize>()
+        .map_err(|_| LowerError(format!("{name} is out of range: {value}")))
+}
+
+fn lower_native_select(select: &native::Select) -> Result<PlanNode, LowerError> {
+    let Some(first) = select.from.first() else {
+        return Err(LowerError("SELECT has no FROM relation".into()));
+    };
+    let mut plan = lower_native_table(first)?;
+    if select.from.len() > 1 {
+        return Err(LowerError(
+            "comma-separated FROM relations are not lowered yet".into(),
+        ));
+    }
+    if let Some(selection) = &select.selection {
+        plan = PlanNode::Filter {
+            input: Box::new(plan),
+            predicate: native_expr_text(selection),
+        };
+    }
+    let groups = select
+        .group_by
+        .iter()
+        .map(native_expr_text)
+        .collect::<Vec<_>>();
+    let projections = select
+        .projection
+        .iter()
+        .map(native_select_item_text)
+        .collect::<Vec<_>>();
+    let aggregates = select
+        .projection
+        .iter()
+        .filter_map(native_aggregate_name)
+        .collect::<Vec<_>>();
+    if !groups.is_empty() || !aggregates.is_empty() {
+        plan = PlanNode::Aggregate {
+            input: Box::new(plan),
+            groups,
+            aggregates,
+        };
+    }
+    if !projections.is_empty() {
+        plan = PlanNode::Project {
+            input: Box::new(plan),
+            expressions: projections,
+        };
+    }
+    Ok(plan)
+}
+
+fn lower_native_table(table: &native::TableRef) -> Result<PlanNode, LowerError> {
+    match table {
+        native::TableRef::Table { name, alias } => {
+            let table = name.join(".");
+            let alias = alias
+                .clone()
+                .unwrap_or_else(|| name.last().cloned().unwrap_or_default());
+            let kind = if matches!(
+                table.to_ascii_lowercase().as_str(),
+                "method_strings"
+                    | "method_numbers"
+                    | "method_calls"
+                    | "method_field_accesses"
+                    | "method_used_types"
+            ) {
+                ScanKind::RawEdge { table, alias }
+            } else if table.eq_ignore_ascii_case("methods") {
+                ScanKind::MethodView { alias }
+            } else {
+                ScanKind::Table { name: table, alias }
+            };
+            Ok(PlanNode::Scan {
+                kind,
+                schema: Schema::default(),
+            })
+        }
+        native::TableRef::Derived { .. } => {
+            Err(LowerError("derived table is not lowered yet".into()))
+        }
+        native::TableRef::Join {
+            left,
+            right,
+            constraint,
+            ..
+        } => Ok(PlanNode::Join {
+            left: Box::new(lower_native_table(left)?),
+            right: Box::new(lower_native_table(right)?),
+            on: native_join_constraint_text(constraint),
+        }),
+    }
+}
+
+fn native_join_constraint_text(constraint: &native::JoinConstraint) -> String {
+    match constraint {
+        native::JoinConstraint::None => String::new(),
+        native::JoinConstraint::On(expr) => native_expr_text(expr),
+        native::JoinConstraint::Using(columns) => format!("USING ({})", columns.join(", ")),
+    }
+}
+
+fn native_select_item_text(item: &native::SelectItem) -> String {
+    match item {
+        native::SelectItem::Wildcard => "*".into(),
+        native::SelectItem::QualifiedWildcard(name) => format!("{name}.*"),
+        native::SelectItem::Expr { expr, alias } => {
+            let text = native_expr_text(expr);
+            alias
+                .as_ref()
+                .map_or(text.clone(), |alias| format!("{text} AS {alias}"))
+        }
+    }
+}
+
+fn native_aggregate_name(item: &native::SelectItem) -> Option<String> {
+    let native::SelectItem::Expr {
+        expr: native::Expr::Function { name, .. },
+        ..
+    } = item
+    else {
+        return None;
+    };
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "count" | "sum" | "avg" | "min" | "max" | "group_concat"
+    )
+    .then(|| name.clone())
+}
+
+fn native_expr_text(expr: &native::Expr) -> String {
+    use native::{Expr, Literal, UnaryOp};
+    match expr {
+        Expr::Identifier(parts) => parts.join("."),
+        Expr::Literal(Literal::Null) => "NULL".into(),
+        Expr::Literal(Literal::Boolean(value)) => value.to_string().to_ascii_uppercase(),
+        Expr::Literal(Literal::Number(value)) | Expr::Literal(Literal::Blob(value)) => {
+            value.clone()
+        }
+        Expr::Literal(Literal::String(value)) => format!("'{value}'"),
+        Expr::Parameter(None) => "?".into(),
+        Expr::Parameter(Some(value)) => value.clone(),
+        Expr::Wildcard => "*".into(),
+        Expr::Unary { op, expr } => format!(
+            "{}{}",
+            match op {
+                UnaryOp::Plus => "+",
+                UnaryOp::Minus => "-",
+                UnaryOp::Not => "NOT ",
+                UnaryOp::BitNot => "~",
+            },
+            native_expr_text(expr)
+        ),
+        Expr::Binary { left, op, right } => format!(
+            "{} {} {}",
+            native_expr_text(left),
+            native_binary_op(op),
+            native_expr_text(right)
+        ),
+        Expr::Escape { expr, escape } => format!(
+            "{} ESCAPE {}",
+            native_expr_text(expr),
+            native_expr_text(escape)
+        ),
+        Expr::IsNull { expr, negated } => format!(
+            "{} IS{} NULL",
+            native_expr_text(expr),
+            if *negated { " NOT" } else { "" }
+        ),
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => format!(
+            "{} {}BETWEEN {} AND {}",
+            native_expr_text(expr),
+            if *negated { "NOT " } else { "" },
+            native_expr_text(low),
+            native_expr_text(high)
+        ),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => format!(
+            "{} {}IN ({})",
+            native_expr_text(expr),
+            if *negated { "NOT " } else { "" },
+            list.iter()
+                .map(native_expr_text)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Expr::InSubquery { expr, negated, .. } => format!(
+            "{} {}IN (<subquery>)",
+            native_expr_text(expr),
+            if *negated { "NOT " } else { "" }
+        ),
+        Expr::Exists { negated, .. } => {
+            format!("{}EXISTS (<subquery>)", if *negated { "NOT " } else { "" })
+        }
+        Expr::Subquery(_) => "(<subquery>)".into(),
+        Expr::Function {
+            name,
+            args,
+            distinct,
+        } => format!(
+            "{name}({}{})",
+            if *distinct { "DISTINCT " } else { "" },
+            args.iter()
+                .map(native_expr_text)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Expr::Case { .. } => "CASE".into(),
+        Expr::Cast { expr, data_type } => {
+            format!("CAST({} AS {data_type})", native_expr_text(expr))
+        }
+    }
+}
+
+fn native_binary_op(op: &native::BinaryOp) -> &'static str {
+    use native::BinaryOp::*;
+    match op {
+        Or => "OR",
+        And => "AND",
+        Eq => "=",
+        NotEq => "!=",
+        Lt => "<",
+        LtEq => "<=",
+        Gt => ">",
+        GtEq => ">=",
+        Is => "IS",
+        IsNot => "IS NOT",
+        Like => "LIKE",
+        Glob => "GLOB",
+        Match => "MATCH",
+        NotLike => "NOT LIKE",
+        NotGlob => "NOT GLOB",
+        NotMatch => "NOT MATCH",
+        In => "IN",
+        NotIn => "NOT IN",
+        Between => "BETWEEN",
+        NotBetween => "NOT BETWEEN",
+        BitOr => "|",
+        BitAnd => "&",
+        ShiftLeft => "<<",
+        ShiftRight => ">>",
+        Add => "+",
+        Sub => "-",
+        Mul => "*",
+        Div => "/",
+        Mod => "%",
+        Concat => "||",
+    }
 }
 
 /// Lower a parsed statement. Keeping this public lets the CLI reuse its parser
@@ -345,5 +644,17 @@ mod tests {
                 ..
             } if table == "method_strings"
         ));
+    }
+
+    #[test]
+    fn native_front_accepts_values_and_set_operations_before_ir_boundary() {
+        let values = lower_sql("VALUES (1), (2)").unwrap_err();
+        assert!(values
+            .0
+            .contains("VALUES are parsed by the native front-end"));
+        let union = lower_sql("SELECT 1 UNION ALL SELECT 2").unwrap_err();
+        assert!(union
+            .0
+            .contains("set operations are parsed by the native front-end"));
     }
 }

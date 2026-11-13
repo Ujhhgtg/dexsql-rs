@@ -16,6 +16,7 @@
 
 pub mod front;
 pub mod parser;
+pub mod query;
 pub mod session;
 pub mod token;
 pub mod walk;

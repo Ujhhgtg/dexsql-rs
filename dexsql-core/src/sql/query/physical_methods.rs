@@ -5,8 +5,7 @@
 use super::*;
 use sqlparser::ast::{
     BinaryOperator, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
-    JoinConstraint, JoinOperator, OrderByKind, Query, Select, SelectItem, Statement, TableFactor,
-    Value,
+    JoinConstraint, JoinOperator, OrderByKind, Query, Select, SelectItem, TableFactor, Value,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,15 +26,7 @@ pub(super) fn pool_mode(sqls: &[String]) -> PoolMode {
     }
     let mut all_count = true;
     for sql in sqls {
-        let Ok(mut statements) =
-            sqlparser::parser::Parser::parse_sql(&expressions::Dialect {}, sql)
-        else {
-            return PoolMode::Full;
-        };
-        if statements.len() != 1 {
-            return PoolMode::Full;
-        }
-        let Statement::Query(query) = statements.remove(0) else {
+        let Ok(query) = super::typed::parse_compat(sql) else {
             return PoolMode::Full;
         };
         if count_identity(&query).is_some() {
@@ -714,12 +705,7 @@ pub(super) fn unshadowed(query: &Query, caches: &NamedCaches) -> bool {
 mod tests {
     use super::*;
     fn query(sql: &str) -> Query {
-        let mut statements =
-            sqlparser::parser::Parser::parse_sql(&expressions::Dialect {}, sql).unwrap();
-        let Statement::Query(query) = statements.remove(0) else {
-            panic!()
-        };
-        *query
+        *super::typed::parse_compat(sql).unwrap()
     }
     fn mode(sql: &[&str]) -> PoolMode {
         pool_mode(&sql.iter().map(|sql| sql.to_string()).collect::<Vec<_>>())

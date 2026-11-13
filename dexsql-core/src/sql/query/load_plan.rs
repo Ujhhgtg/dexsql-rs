@@ -1,7 +1,7 @@
 //! Batch-wide proofs for dropping unobserved metadata during loading.
 use super::*;
 use sqlparser::ast::{
-    Expr, GroupByExpr, JoinConstraint, JoinOperator, Query, SelectItem, Statement, TableFactor,
+    Expr, GroupByExpr, JoinConstraint, JoinOperator, Query, SelectItem, TableFactor,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -279,18 +279,10 @@ pub(super) fn plan_batch(sqls: &[String]) -> LoadPlan {
         omit_pools: true,
     };
     for sql in sqls {
-        let Ok(mut statements) =
-            sqlparser::parser::Parser::parse_sql(&expressions::Dialect {}, sql)
-        else {
+        let Ok(statement) = super::typed::parse_compat(sql) else {
             return LoadPlan::FULL;
         };
-        if statements.len() != 1 {
-            return LoadPlan::FULL;
-        }
-        let Statement::Query(query) = statements.remove(0) else {
-            return LoadPlan::FULL;
-        };
-        let Some(next) = query_plan(&query) else {
+        let Some(next) = query_plan(&statement) else {
             return LoadPlan::FULL;
         };
         plan.omit_class_members &= next.omit_class_members;

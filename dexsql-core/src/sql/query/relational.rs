@@ -1627,13 +1627,7 @@ mod tests {
     }
 
     fn parse(sql: &str) -> Query {
-        let mut statements =
-            sqlparser::parser::Parser::parse_sql(&super::super::expressions::Dialect {}, sql)
-                .unwrap();
-        let sqlparser::ast::Statement::Query(query) = statements.remove(0) else {
-            panic!()
-        };
-        *query
+        *super::super::typed::parse_compat(sql).unwrap()
     }
 
     fn run(sql: &str, ds: &Dataset, limit: Option<u64>) -> QueryResult {

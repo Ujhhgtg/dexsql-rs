@@ -47,6 +47,22 @@ dexsql-cli/tests/        executable contract tests
 Small implementation components remain modules. Add a crate only when it needs
 an independent consumer, dependency boundary, or release lifecycle.
 
+## SQL parser migration
+
+The reference executable embeds a self-written `dexsql-ast` tokenizer, parser,
+read-only front end, and session validator. The workspace now uses that native
+tokenizer/front path for query validation and has a recursive-descent query AST
+in `dexsql-core/src/sql/ast/query.rs`. `lower_sql` already lowers SELECT,
+JOIN, filters, aggregates, ordering and limits from that native AST; VALUES and
+set operations are parsed natively and currently stop at the existing IR
+boundary with an explicit error.
+
+The execution planner still has a compatibility AST bridge backed by the
+`sqlparser` dependency. Remaining migration work is isolated to planner and
+execution modules (`typed`, `relational`, `streaming`, correlated/membership,
+and query-shape helpers). Removing the dependency is intentionally gated on
+the same SQL corpus and MCP differential checks used for the current release.
+
 ## Build and validation
 
 ```sh

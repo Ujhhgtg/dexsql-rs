@@ -3,9 +3,10 @@
 //! `"12"`, SQL NULL, integers and blobs must remain distinct in MCP results.
 
 use super::*;
+use crate::sql::ast::query as native;
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, JoinConstraint, Query,
-    Select, SelectItem, SetExpr, Statement, TableFactor, UnaryOperator, Value,
+    Select, SelectItem, SetExpr, TableFactor, UnaryOperator, Value,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,7 +85,7 @@ impl QuerySession {
                 rows: Vec::new(),
             });
         };
-        let mut query = parse(sql).map_err(DexSqlError::from_executor_string)?;
+        let mut query = parse_compat(sql).map_err(DexSqlError::from_executor_string)?;
         let definitions = self.caches.definitions.borrow().clone();
         let shapes = query_shape(&query, &definitions, &mut HashSet::new());
         expand_wildcards(&mut query, &definitions, &mut HashSet::new());
@@ -132,16 +133,563 @@ fn typed_value(value: Scalar, integer: Integer) -> TypedValue {
     }
 }
 
-fn parse(sql: &str) -> Result<Box<Query>, String> {
-    let statements = sqlparser::parser::Parser::parse_sql(&expressions::Dialect {}, sql)
-        .map_err(|error| format!("SQL parse error: {error}"))?;
-    let [Statement::Query(query)] = statements.as_slice() else {
-        return Err("expected one read-only SQL query".into());
+/// Shared compatibility bridge: parse through the native AST and lower the
+/// result into the legacy execution AST. Runtime planner modules use this
+/// while their visitors are migrated off sqlparser enums.
+pub(super) fn parse_compat(sql: &str) -> Result<Box<Query>, String> {
+    let query = native::parse_query(sql).map_err(|error| match error.span {
+        Some((start, end)) => format!("SQL parse error at {start}..{end}: {}", error.message),
+        None => format!("SQL parse error: {}", error.message),
+    })?;
+    Ok(Box::new(compat_query(&query)?))
+}
+
+/// Convert the recovered native AST to the executor's older compatibility AST.
+/// The executor still needs its established relational node shapes; parsing is
+/// native, while this bridge keeps the execution migration incremental.
+fn compat_query(query: &native::Query) -> Result<Query, String> {
+    let with = if query.with.is_empty() {
+        None
+    } else {
+        Some(compat_with(query)?)
     };
-    let mut query = query.clone();
-    lower_substring_calls(&mut query, sql);
-    lower_blob_literals(&mut query, sql);
-    Ok(query)
+    let order_by = if query.order_by.is_empty() {
+        None
+    } else {
+        Some(sqlparser::ast::OrderBy {
+            kind: sqlparser::ast::OrderByKind::Expressions(
+                query
+                    .order_by
+                    .iter()
+                    .map(compat_order_by)
+                    .collect::<Result<_, _>>()?,
+            ),
+            interpolate: None,
+        })
+    };
+    Ok(Query {
+        with,
+        body: Box::new(compat_set_expr(&query.body)?),
+        order_by,
+        limit_clause: match (&query.limit, &query.offset) {
+            (Some(limit), offset) => Some(sqlparser::ast::LimitClause::LimitOffset {
+                limit: Some(compat_expr(limit)?),
+                offset: match offset {
+                    Some(value) => Some(sqlparser::ast::Offset {
+                        value: compat_expr(value)?,
+                        rows: sqlparser::ast::OffsetRows::None,
+                    }),
+                    None => None,
+                },
+                limit_by: Vec::new(),
+            }),
+            (None, Some(offset)) => Some(sqlparser::ast::LimitClause::LimitOffset {
+                limit: None,
+                offset: Some(sqlparser::ast::Offset {
+                    value: compat_expr(offset)?,
+                    rows: sqlparser::ast::OffsetRows::None,
+                }),
+                limit_by: Vec::new(),
+            }),
+            (None, None) => None,
+        },
+        fetch: None,
+        locks: Vec::new(),
+        for_clause: None,
+        settings: None,
+        format_clause: None,
+        pipe_operators: Vec::new(),
+    })
+}
+
+fn compat_with(query: &native::Query) -> Result<sqlparser::ast::With, String> {
+    let recursive = query.with.iter().any(|cte| cte.recursive);
+    Ok(sqlparser::ast::With {
+        with_token: sqlparser::ast::helpers::attached_token::AttachedToken::empty(),
+        recursive,
+        cte_tables: query
+            .with
+            .iter()
+            .map(compat_cte)
+            .collect::<Result<_, _>>()?,
+    })
+}
+
+fn compat_cte(cte: &native::Cte) -> Result<sqlparser::ast::Cte, String> {
+    Ok(sqlparser::ast::Cte {
+        alias: sqlparser::ast::TableAlias {
+            explicit: false,
+            name: ident(&cte.name),
+            columns: cte
+                .columns
+                .iter()
+                .map(|name| sqlparser::ast::TableAliasColumnDef {
+                    name: ident(name),
+                    data_type: None,
+                })
+                .collect(),
+            at: None,
+        },
+        query: Box::new(compat_query(&cte.query)?),
+        from: None,
+        materialized: None,
+        closing_paren_token: sqlparser::ast::helpers::attached_token::AttachedToken::empty(),
+    })
+}
+
+fn compat_set_expr(expr: &native::SetExpr) -> Result<SetExpr, String> {
+    Ok(match expr {
+        native::SetExpr::Select(select) => SetExpr::Select(Box::new(compat_select(select)?)),
+        native::SetExpr::Values(rows) => SetExpr::Values(sqlparser::ast::Values {
+            explicit_row: false,
+            value_keyword: false,
+            rows: rows
+                .iter()
+                .map(|row| {
+                    Ok(sqlparser::ast::Parens::with_empty_span(
+                        row.iter().map(compat_expr).collect::<Result<_, _>>()?,
+                    ))
+                })
+                .collect::<Result<_, String>>()?,
+        }),
+        native::SetExpr::SetOp {
+            left,
+            op,
+            all,
+            right,
+        } => SetExpr::SetOperation {
+            left: Box::new(compat_set_expr(left)?),
+            op: match op {
+                native::SetOperator::Union => sqlparser::ast::SetOperator::Union,
+                native::SetOperator::Intersect => sqlparser::ast::SetOperator::Intersect,
+                native::SetOperator::Except => sqlparser::ast::SetOperator::Except,
+            },
+            set_quantifier: if *all {
+                sqlparser::ast::SetQuantifier::All
+            } else {
+                sqlparser::ast::SetQuantifier::None
+            },
+            right: Box::new(compat_set_expr(right)?),
+        },
+    })
+}
+
+fn compat_select(select: &native::Select) -> Result<Select, String> {
+    Ok(Select {
+        select_token: sqlparser::ast::helpers::attached_token::AttachedToken::empty(),
+        optimizer_hints: Vec::new(),
+        distinct: select
+            .distinct
+            .then_some(sqlparser::ast::Distinct::Distinct),
+        select_modifiers: None,
+        top: None,
+        top_before_distinct: false,
+        projection: select
+            .projection
+            .iter()
+            .map(compat_select_item)
+            .collect::<Result<_, _>>()?,
+        exclude: None,
+        into: None,
+        from: select
+            .from
+            .iter()
+            .map(compat_table_with_joins)
+            .collect::<Result<_, _>>()?,
+        lateral_views: Vec::new(),
+        prewhere: None,
+        selection: select.selection.as_ref().map(compat_expr).transpose()?,
+        connect_by: Vec::new(),
+        group_by: sqlparser::ast::GroupByExpr::Expressions(
+            select
+                .group_by
+                .iter()
+                .map(compat_expr)
+                .collect::<Result<_, _>>()?,
+            Vec::new(),
+        ),
+        cluster_by: Vec::new(),
+        distribute_by: Vec::new(),
+        sort_by: Vec::new(),
+        having: select.having.as_ref().map(compat_expr).transpose()?,
+        named_window: Vec::new(),
+        qualify: None,
+        window_before_qualify: false,
+        value_table_mode: None,
+        flavor: sqlparser::ast::SelectFlavor::Standard,
+    })
+}
+
+fn compat_select_item(item: &native::SelectItem) -> Result<SelectItem, String> {
+    Ok(match item {
+        native::SelectItem::Wildcard => {
+            SelectItem::Wildcard(sqlparser::ast::WildcardAdditionalOptions::default())
+        }
+        native::SelectItem::QualifiedWildcard(name) => SelectItem::QualifiedWildcard(
+            sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(object_name(
+                &name.split('.').map(str::to_owned).collect::<Vec<_>>(),
+            )),
+            sqlparser::ast::WildcardAdditionalOptions::default(),
+        ),
+        native::SelectItem::Expr { expr, alias } => match alias {
+            Some(alias) => SelectItem::ExprWithAlias {
+                expr: compat_expr(expr)?,
+                alias: ident(alias),
+            },
+            None => SelectItem::UnnamedExpr(compat_expr(expr)?),
+        },
+    })
+}
+
+fn compat_table_with_joins(
+    table: &native::TableRef,
+) -> Result<sqlparser::ast::TableWithJoins, String> {
+    let (relation, joins) = flatten_table(table)?;
+    Ok(sqlparser::ast::TableWithJoins { relation, joins })
+}
+
+fn flatten_table(
+    table: &native::TableRef,
+) -> Result<(TableFactor, Vec<sqlparser::ast::Join>), String> {
+    match table {
+        native::TableRef::Join {
+            left,
+            kind,
+            right,
+            constraint,
+        } => {
+            let (relation, mut joins) = flatten_table(left)?;
+            let right = compat_factor(right)?;
+            let constraint = compat_join_constraint(constraint)?;
+            let join_operator = match kind {
+                native::JoinKind::Inner => sqlparser::ast::JoinOperator::Inner(constraint),
+                native::JoinKind::Left => sqlparser::ast::JoinOperator::Left(constraint),
+                native::JoinKind::Right => sqlparser::ast::JoinOperator::Right(constraint),
+                native::JoinKind::Full => sqlparser::ast::JoinOperator::FullOuter(constraint),
+                native::JoinKind::Cross => sqlparser::ast::JoinOperator::CrossJoin(constraint),
+                native::JoinKind::Natural => {
+                    sqlparser::ast::JoinOperator::Join(sqlparser::ast::JoinConstraint::Natural)
+                }
+            };
+            joins.push(sqlparser::ast::Join {
+                relation: right,
+                global: false,
+                join_operator,
+            });
+            Ok((relation, joins))
+        }
+        _ => Ok((compat_factor(table)?, Vec::new())),
+    }
+}
+
+fn compat_factor(table: &native::TableRef) -> Result<TableFactor, String> {
+    Ok(match table {
+        native::TableRef::Table { name, alias } => TableFactor::Table {
+            name: object_name(name),
+            alias: alias.as_ref().map(|name| sqlparser::ast::TableAlias {
+                explicit: false,
+                name: ident(name),
+                columns: Vec::new(),
+                at: None,
+            }),
+            args: None,
+            with_hints: Vec::new(),
+            version: None,
+            with_ordinality: false,
+            partitions: Vec::new(),
+            json_path: None,
+            sample: None,
+            index_hints: Vec::new(),
+        },
+        native::TableRef::Derived { query, alias } => TableFactor::Derived {
+            lateral: false,
+            subquery: Box::new(compat_query(query)?),
+            alias: alias.as_ref().map(|name| sqlparser::ast::TableAlias {
+                explicit: false,
+                name: ident(name),
+                columns: Vec::new(),
+                at: None,
+            }),
+            sample: None,
+        },
+        native::TableRef::Join { .. } => return Err("nested join relation is not supported".into()),
+    })
+}
+
+fn compat_join_constraint(constraint: &native::JoinConstraint) -> Result<JoinConstraint, String> {
+    Ok(match constraint {
+        native::JoinConstraint::None => JoinConstraint::None,
+        native::JoinConstraint::On(expr) => JoinConstraint::On(compat_expr(expr)?),
+        native::JoinConstraint::Using(names) => JoinConstraint::Using(
+            names
+                .iter()
+                .map(|name| object_name(std::slice::from_ref(name)))
+                .collect(),
+        ),
+    })
+}
+
+fn compat_order_by(order: &native::OrderBy) -> Result<sqlparser::ast::OrderByExpr, String> {
+    Ok(sqlparser::ast::OrderByExpr {
+        expr: compat_expr(&order.expr)?,
+        options: sqlparser::ast::OrderByOptions {
+            sort: Some(if order.asc {
+                sqlparser::ast::OrderBySort::Asc
+            } else {
+                sqlparser::ast::OrderBySort::Desc
+            }),
+            nulls_first: order.nulls_first,
+        },
+        with_fill: None,
+    })
+}
+
+fn compat_expr(expr: &native::Expr) -> Result<Expr, String> {
+    use native::{Expr as NExpr, Literal, UnaryOp as NUnary};
+    Ok(match expr {
+        NExpr::Identifier(parts) => {
+            if parts.len() == 1 {
+                Expr::Identifier(ident(&parts[0]))
+            } else {
+                Expr::CompoundIdentifier(parts.iter().map(|part| ident(part)).collect())
+            }
+        }
+        NExpr::Literal(literal) => Expr::Value(sqlparser::ast::ValueWithSpan {
+            value: match literal {
+                Literal::Null => Value::Null,
+                Literal::Boolean(value) => Value::Boolean(*value),
+                Literal::Number(value) => Value::Number(normalize_number(value), false),
+                Literal::String(value) => Value::SingleQuotedString(value.clone()),
+                Literal::Blob(value) => Value::HexStringLiteral(value.clone()),
+            },
+            span: sqlparser::tokenizer::Span::empty(),
+        }),
+        NExpr::Parameter(name) => Expr::Value(sqlparser::ast::ValueWithSpan {
+            value: Value::Placeholder(name.clone().unwrap_or_else(|| "?".into())),
+            span: sqlparser::tokenizer::Span::empty(),
+        }),
+        NExpr::Wildcard => {
+            Expr::Wildcard(sqlparser::ast::helpers::attached_token::AttachedToken::empty())
+        }
+        NExpr::Unary { op, expr } => Expr::UnaryOp {
+            op: match op {
+                NUnary::Plus => UnaryOperator::Plus,
+                NUnary::Minus => UnaryOperator::Minus,
+                NUnary::Not => UnaryOperator::Not,
+                NUnary::BitNot => UnaryOperator::BitwiseNot,
+            },
+            expr: Box::new(compat_expr(expr)?),
+        },
+        NExpr::Binary { left, op, right } => {
+            if matches!(op, native::BinaryOp::Is | native::BinaryOp::IsNot)
+                && matches!(right.as_ref(), NExpr::Literal(Literal::Null))
+            {
+                let value = Box::new(compat_expr(left)?);
+                return Ok(if matches!(op, native::BinaryOp::IsNot) {
+                    Expr::IsNotNull(value)
+                } else {
+                    Expr::IsNull(value)
+                });
+            }
+            let left = Box::new(compat_expr(left)?);
+            let right = Box::new(compat_expr(right)?);
+            match op {
+                native::BinaryOp::Like | native::BinaryOp::NotLike => Expr::Like {
+                    negated: matches!(op, native::BinaryOp::NotLike),
+                    any: false,
+                    expr: left,
+                    pattern: right,
+                    escape_char: None,
+                },
+                native::BinaryOp::Glob | native::BinaryOp::NotGlob => Expr::BinaryOp {
+                    left,
+                    op: BinaryOperator::Glob,
+                    right,
+                },
+                native::BinaryOp::Is => Expr::IsNotDistinctFrom(left, right),
+                native::BinaryOp::IsNot => Expr::IsDistinctFrom(left, right),
+                _ => Expr::BinaryOp {
+                    left,
+                    op: compat_binary_op(op)?,
+                    right,
+                },
+            }
+        }
+        NExpr::Escape { expr, escape } => match compat_expr(expr)? {
+            Expr::Like {
+                negated,
+                any,
+                expr,
+                pattern,
+                ..
+            } => Expr::Like {
+                negated,
+                any,
+                expr,
+                pattern,
+                escape_char: Some(Box::new(compat_expr(escape)?)),
+            },
+            other => {
+                return Err(format!(
+                    "ESCAPE applied to unsupported expression {other:?}"
+                ))
+            }
+        },
+        NExpr::IsNull { expr, negated } => {
+            if *negated {
+                Expr::IsNotNull(Box::new(compat_expr(expr)?))
+            } else {
+                Expr::IsNull(Box::new(compat_expr(expr)?))
+            }
+        }
+        NExpr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => Expr::Between {
+            expr: Box::new(compat_expr(expr)?),
+            negated: *negated,
+            low: Box::new(compat_expr(low)?),
+            high: Box::new(compat_expr(high)?),
+        },
+        NExpr::InList {
+            expr,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(compat_expr(expr)?),
+            list: list.iter().map(compat_expr).collect::<Result<_, _>>()?,
+            negated: *negated,
+        },
+        NExpr::InSubquery {
+            expr,
+            query,
+            negated,
+        } => Expr::InSubquery {
+            expr: Box::new(compat_expr(expr)?),
+            subquery: Box::new(compat_query(query)?),
+            negated: *negated,
+        },
+        NExpr::Exists { query, negated } => Expr::Exists {
+            subquery: Box::new(compat_query(query)?),
+            negated: *negated,
+        },
+        NExpr::Subquery(query) => Expr::Subquery(Box::new(compat_query(query)?)),
+        NExpr::Function {
+            name,
+            args,
+            distinct,
+        } => Expr::Function(sqlparser::ast::Function {
+            name: object_name(&name.split('.').map(str::to_owned).collect::<Vec<_>>()),
+            uses_odbc_syntax: false,
+            parameters: FunctionArguments::None,
+            args: FunctionArguments::List(sqlparser::ast::FunctionArgumentList {
+                duplicate_treatment: (*distinct)
+                    .then_some(sqlparser::ast::DuplicateTreatment::Distinct),
+                args: args
+                    .iter()
+                    .map(|arg| Ok(FunctionArg::Unnamed(compat_arg(arg)?)))
+                    .collect::<Result<_, String>>()?,
+                clauses: Vec::new(),
+            }),
+            within_group: Vec::new(),
+            filter: None,
+            null_treatment: None,
+            over: None,
+        }),
+        NExpr::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => Expr::Case {
+            case_token: sqlparser::ast::helpers::attached_token::AttachedToken::empty(),
+            end_token: sqlparser::ast::helpers::attached_token::AttachedToken::empty(),
+            operand: operand
+                .as_ref()
+                .map(|expr| compat_expr(expr))
+                .transpose()?
+                .map(Box::new),
+            conditions: when_then
+                .iter()
+                .map(|(condition, result)| {
+                    Ok(sqlparser::ast::CaseWhen {
+                        condition: compat_expr(condition)?,
+                        result: compat_expr(result)?,
+                    })
+                })
+                .collect::<Result<_, String>>()?,
+            else_result: else_expr
+                .as_ref()
+                .map(|expr| compat_expr(expr))
+                .transpose()?
+                .map(Box::new),
+        },
+        NExpr::Cast { expr, data_type } => Expr::Cast {
+            kind: sqlparser::ast::CastKind::Cast,
+            expr: Box::new(compat_expr(expr)?),
+            data_type: sqlparser::ast::DataType::Custom(
+                object_name(&[data_type.clone()]),
+                Vec::new(),
+            ),
+            format: None,
+        },
+    })
+}
+
+fn compat_arg(expr: &native::Expr) -> Result<FunctionArgExpr, String> {
+    Ok(match expr {
+        native::Expr::Wildcard => FunctionArgExpr::Wildcard,
+        _ => FunctionArgExpr::Expr(compat_expr(expr)?),
+    })
+}
+
+fn compat_binary_op(op: &native::BinaryOp) -> Result<BinaryOperator, String> {
+    use native::BinaryOp as Op;
+    Ok(match op {
+        Op::Or => BinaryOperator::Or,
+        Op::And => BinaryOperator::And,
+        Op::Eq => BinaryOperator::Eq,
+        Op::NotEq => BinaryOperator::NotEq,
+        Op::Lt => BinaryOperator::Lt,
+        Op::LtEq => BinaryOperator::LtEq,
+        Op::Gt => BinaryOperator::Gt,
+        Op::GtEq => BinaryOperator::GtEq,
+        Op::Like | Op::NotLike => return Err("LIKE expressions must use native LIKE nodes".into()),
+        Op::Glob | Op::NotGlob => return Err("GLOB expressions must use native LIKE nodes".into()),
+        Op::Match | Op::NotMatch => BinaryOperator::Match,
+        Op::Is => BinaryOperator::Eq,
+        Op::IsNot => BinaryOperator::NotEq,
+        Op::In | Op::NotIn | Op::Between | Op::NotBetween => {
+            return Err("invalid binary membership operator".into())
+        }
+        Op::BitOr => BinaryOperator::BitwiseOr,
+        Op::BitAnd => BinaryOperator::BitwiseAnd,
+        Op::ShiftLeft => BinaryOperator::PGBitwiseShiftLeft,
+        Op::ShiftRight => BinaryOperator::PGBitwiseShiftRight,
+        Op::Add => BinaryOperator::Plus,
+        Op::Sub => BinaryOperator::Minus,
+        Op::Mul => BinaryOperator::Multiply,
+        Op::Div => BinaryOperator::Divide,
+        Op::Mod => BinaryOperator::Modulo,
+        Op::Concat => BinaryOperator::StringConcat,
+    })
+}
+
+fn ident(name: &str) -> sqlparser::ast::Ident {
+    sqlparser::ast::Ident::new(name)
+}
+
+fn object_name(parts: &[String]) -> sqlparser::ast::ObjectName {
+    sqlparser::ast::ObjectName::from(parts.iter().map(|part| ident(part)).collect::<Vec<_>>())
+}
+
+fn normalize_number(value: &str) -> String {
+    value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+        .map_or_else(|| value.to_owned(), |number| number.to_string())
 }
 
 /// Used by the temporary relation cache too: caching an intermediate result
@@ -152,7 +700,7 @@ pub(super) fn execute_rows(
     caches: &NamedCaches,
 ) -> Result<SetRows, String> {
     let _precision = Precision::new();
-    let mut query = parse(sql)?;
+    let mut query = parse_compat(sql)?;
     expand_wildcards(
         &mut query,
         &caches.definitions.borrow(),
@@ -397,7 +945,7 @@ fn source(
                 .unwrap_or_else(|| name.to_string().to_ascii_lowercase());
             let columns = if let Some(sql) = definitions.get(&table) {
                 if expanding.insert(table.clone()) {
-                    let columns = parse(sql)
+                    let columns = parse_compat(sql)
                         .map(|query| query_shape(&query, definitions, expanding))
                         .unwrap_or_default();
                     expanding.remove(&table);
@@ -805,7 +1353,7 @@ mod tests {
 
     #[test]
     fn output_schema_resolves_qualified_columns_and_outer_nulls() {
-        let query = parse("SELECT m.access_flags,c.access_flags,s.value FROM methods m JOIN classes c ON m.class_idx=c.class_idx LEFT JOIN method_strings s ON m.method_idx=s.method_idx").unwrap();
+        let query = parse_compat("SELECT m.access_flags,c.access_flags,s.value FROM methods m JOIN classes c ON m.class_idx=c.class_idx LEFT JOIN method_strings s ON m.method_idx=s.method_idx").unwrap();
         let columns = query_shape(&query, &HashMap::new(), &mut HashSet::new());
         assert!(columns[0].column.nullable);
         assert!(!columns[1].column.nullable);
@@ -814,9 +1362,10 @@ mod tests {
 
     #[test]
     fn duplicate_join_columns_are_projected_by_qualified_identity() {
-        let mut query =
-            parse("SELECT * FROM methods m JOIN method_strings s ON m.method_idx=s.method_idx")
-                .unwrap();
+        let mut query = parse_compat(
+            "SELECT * FROM methods m JOIN method_strings s ON m.method_idx=s.method_idx",
+        )
+        .unwrap();
         expand_wildcards(&mut query, &HashMap::new(), &mut HashSet::new());
         let select = query.body.as_select().unwrap();
         assert_eq!(select.projection.len(), 22);

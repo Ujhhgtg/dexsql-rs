@@ -4,11 +4,11 @@ use super::{
     charge_materialized, eval_bool, eval_scalar, membership, streaming, Dataset, NamedCaches,
     RelRow, Scalar,
 };
+use crate::sql::ast::token::{tokenize, TokenKind};
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
     Query, SelectItem, TableFactor,
 };
-use sqlparser::tokenizer::{Token, Tokenizer};
 use std::collections::{HashMap, HashSet};
 
 fn unsupported(reason: &str) -> String {
@@ -1067,25 +1067,26 @@ fn mentions_outer(
         return Ok(false);
     }
     let sql = query.to_string();
-    let tokens = Tokenizer::new(&sqlparser::dialect::SQLiteDialect {}, &sql)
-        .tokenize()
-        .map_err(|error| unsupported(&error.to_string()))?
-        .into_iter()
-        .filter(|token| !matches!(token, Token::Whitespace(_)))
-        .collect::<Vec<_>>();
-    Ok(tokens.windows(3).any(|tokens| matches!(tokens, [Token::Word(alias), Token::Period, Token::Word(_)] if aliases.contains(&alias.value.to_ascii_lowercase()) && !shadowed.contains(&alias.value.to_ascii_lowercase()))))
+    let tokens = tokenize(&sql).map_err(|error| unsupported(&error.message))?;
+    Ok(tokens.windows(3).any(|tokens| {
+        matches!(&tokens[0].kind, TokenKind::Ident { upper }
+            if aliases.contains(&upper.to_ascii_lowercase()) && !shadowed.contains(&upper.to_ascii_lowercase()))
+            && tokens[1].kind == TokenKind::Dot
+            && matches!(tokens[2].kind, TokenKind::Ident { .. } | TokenKind::QuotedIdent)
+    }))
 }
 
 fn expr_mentions_outer(expr: &Expr, aliases: &HashSet<String>) -> Result<bool, String> {
     let sql = expr.to_string();
-    let tokens = Tokenizer::new(&sqlparser::dialect::SQLiteDialect {}, &sql)
-        .tokenize()
-        .map_err(|error| unsupported(&error.to_string()))?;
+    let tokens = tokenize(&sql).map_err(|error| unsupported(&error.message))?;
     Ok(tokens.windows(3).any(|tokens| {
-        matches!(tokens,
-            [Token::Word(alias), Token::Period, Token::Word(_)]
-                if aliases.contains(&alias.value.to_ascii_lowercase())
-        )
+        matches!(&tokens[0].kind, TokenKind::Ident { upper }
+            if aliases.contains(&upper.to_ascii_lowercase()))
+            && tokens[1].kind == TokenKind::Dot
+            && matches!(
+                tokens[2].kind,
+                TokenKind::Ident { .. } | TokenKind::QuotedIdent
+            )
     }))
 }
 
@@ -1103,14 +1104,7 @@ mod tests {
         .unwrap()
     }
     fn query(sql: &str) -> Query {
-        let statement =
-            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::SQLiteDialect {}, sql)
-                .unwrap()
-                .remove(0);
-        let sqlparser::ast::Statement::Query(query) = statement else {
-            panic!()
-        };
-        *query
+        *super::super::typed::parse_compat(sql).unwrap()
     }
     fn compiled(sql: &str, ds: &Dataset, negated: bool) -> Expr {
         exists(

@@ -1828,14 +1828,7 @@ mod tests {
         .unwrap()
     }
     fn parse(sql: &str) -> sqlparser::ast::Query {
-        let statement =
-            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::SQLiteDialect {}, sql)
-                .unwrap()
-                .remove(0);
-        let sqlparser::ast::Statement::Query(query) = statement else {
-            panic!()
-        };
-        *query
+        *super::super::typed::parse_compat(sql).unwrap()
     }
     #[test]
     fn ordered_prefix_topk_preserves_distinct_offsets_aliases_and_unsorted_sources() {

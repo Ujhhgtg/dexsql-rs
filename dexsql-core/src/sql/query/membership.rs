@@ -584,15 +584,7 @@ mod tests {
     use super::*;
 
     fn expression(sql: &str) -> Expr {
-        let statement = sqlparser::parser::Parser::parse_sql(
-            &sqlparser::dialect::SQLiteDialect {},
-            &format!("SELECT {sql}"),
-        )
-        .unwrap()
-        .remove(0);
-        let sqlparser::ast::Statement::Query(query) = statement else {
-            panic!()
-        };
+        let query = super::super::typed::parse_compat(&format!("SELECT {sql}")).unwrap();
         let sqlparser::ast::SelectItem::UnnamedExpr(expr) =
             &query.body.as_select().unwrap().projection[0]
         else {
