@@ -1,5 +1,126 @@
 use super::*;
 
+#[test]
+#[ignore = "requires DEXSQL_QUERY_AUDIT pointing to extracted query JSON"]
+fn extracted_descriptor_queries_use_bounded_plans() {
+    let path = std::env::var("DEXSQL_QUERY_AUDIT").unwrap();
+    let queries: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let dataset = if let Ok(apk) = std::env::var("DEXSQL_QUERY_AUDIT_APK") {
+        Dataset::load_paths(&[PathBuf::from(apk)]).unwrap()
+    } else {
+        Dataset::default()
+    };
+    let mut unsupported = Vec::new();
+    for query in queries.as_array().unwrap() {
+        let sql = query["sql"].as_str().unwrap();
+        let started = std::time::Instant::now();
+        match fast_descriptor::try_fast_descriptor_lookup(&parse(sql), &dataset, None) {
+            None => unsupported.push(format!("{}: {sql}", query["id"])),
+            Some(result) => {
+                let result = result.unwrap();
+                eprintln!(
+                    "{} {}ms {} rows",
+                    query["id"],
+                    started.elapsed().as_millis(),
+                    result.rows.len()
+                );
+                println!(
+                    "{}",
+                    serde_json::json!({"id": query["id"], "columns": result.columns, "rows": result.rows})
+                );
+            }
+        }
+    }
+    for file in &dataset.files {
+        for (kind, descriptors) in [
+            ("methods", &file.method_descriptors),
+            ("fields", &file.field_descriptors),
+        ] {
+            assert!(
+                descriptors.get().is_none(),
+                "{} materialized all {kind} descriptors",
+                file.entry_name
+            );
+        }
+    }
+    assert!(unsupported.is_empty(), "{}", unsupported.join("\n"));
+}
+
+#[test]
+fn field_descriptor_lookups_do_not_materialize_descriptor_tables() {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../fixtures/dex/alpha.dex");
+    for sql in [
+        "SELECT DISTINCT f.descriptor AS descriptor FROM fields f WHERE f.name = 'name' ORDER BY f.descriptor LIMIT 1",
+        "SELECT DISTINCT c.descriptor AS descriptor FROM classes c JOIN class_fields cf ON cf.class_descriptor = c.descriptor WHERE cf.file_id = c.file_id AND cf.field_name = 'name' AND instr(cf.field_descriptor, ':Ljava/lang/String;') > 0 ORDER BY c.descriptor",
+        "SELECT DISTINCT m.descriptor AS descriptor FROM methods m JOIN method_field_accesses fa ON fa.method = m.descriptor WHERE fa.file_id = m.file_id AND fa.method_idx = m.method_idx AND m.name = 'fieldTraffic' AND fa.field = 'Lfixtures/Alpha;->name:Ljava/lang/String;' AND fa.using_type = 'get' ORDER BY m.descriptor",
+        "SELECT DISTINCT m.descriptor AS descriptor FROM methods m JOIN method_field_accesses fa ON fa.method = m.descriptor WHERE fa.file_id = m.file_id AND fa.method_idx = m.method_idx AND fa.field = 'Lfixtures/Alpha;->name:Ljava/lang/String;' AND fa.using_type = 'get' ORDER BY m.descriptor",
+        "SELECT DISTINCT m.descriptor AS descriptor FROM methods m JOIN method_field_accesses fa ON fa.method = m.descriptor WHERE fa.file_id = m.file_id AND fa.method_idx = m.method_idx AND m.name = 'add' AND fa.field_name = 'name' AND fa.field_type = 'Ljava/lang/String;' AND fa.using_type = 'put' ORDER BY m.descriptor",
+        "SELECT DISTINCT f.descriptor AS descriptor FROM fields f JOIN method_field_accesses fa ON fa.field = f.descriptor JOIN methods fm ON fm.descriptor = fa.method WHERE fa.file_id = f.file_id AND fa.field_idx = f.field_idx AND fm.file_id = fa.file_id AND fm.method_idx = fa.method_idx AND fa.using_type = 'get' AND fm.name = 'fieldTraffic' ORDER BY f.descriptor",
+        "SELECT DISTINCT f.descriptor AS descriptor FROM fields f JOIN method_field_accesses fa ON fa.field = f.descriptor JOIN methods fm ON fm.descriptor = fa.method WHERE f.type_descriptor = 'Ljava/lang/String;' AND fa.file_id = f.file_id AND fa.field_idx = f.field_idx AND fm.file_id = fa.file_id AND fm.method_idx = fa.method_idx AND fa.using_type = 'get' AND fm.descriptor = 'Lfixtures/Alpha;->fieldTraffic()I' ORDER BY f.descriptor",
+    ] {
+        let dataset = Dataset::load_paths(std::slice::from_ref(&fixture)).unwrap();
+        let query = parse(sql);
+        let actual = fast_descriptor::try_fast_descriptor_lookup(&query, &dataset, None)
+            .unwrap_or_else(|| panic!("field lookup must use the fast path: {sql}"))
+            .unwrap();
+        assert!(!actual.rows.is_empty(), "{sql}");
+        for file in &dataset.files {
+            assert!(file.field_descriptors.get().is_none(), "{sql}");
+            assert!(file.method_descriptors.get().is_none(), "{sql}");
+        }
+        let expected = execute_query(&query, &dataset, Some(&dataset), &NamedCaches::default(), None, false).unwrap();
+        assert_eq!(actual.columns, expected.columns, "{sql}");
+        assert_eq!(actual.rows, expected.rows, "{sql}");
+    }
+}
+
+#[test]
+fn exact_method_descriptor_lookups_work_without_lookup_indexes() {
+    let dataset = Dataset::load_paths_with_requirements(
+        &[PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../fixtures/dex/alpha.dex")],
+        IndexNeeds::default(),
+        false,
+        false,
+        true,
+    )
+    .unwrap();
+    assert!(dataset.files[0].methods_by_class.is_empty());
+    for predicate in [
+        "",
+        " AND m.name = 'missing'",
+        " AND m.descriptor = 'Lfixtures/Alpha;->helper()I'",
+    ] {
+        let query = parse(&format!("SELECT DISTINCT m.descriptor AS descriptor FROM methods m WHERE m.descriptor = 'Lfixtures/Alpha;->fieldTraffic()I'{predicate} ORDER BY m.descriptor"));
+        let actual = fast_descriptor::try_fast_descriptor_lookup(&query, &dataset, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual.rows.len(), usize::from(predicate.is_empty()));
+        assert!(dataset.files[0].method_descriptors.get().is_none());
+    }
+}
+
+#[test]
+fn missing_field_access_descriptors_do_not_materialize_descriptor_tables() {
+    let dataset = Dataset::load_paths(&[
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../fixtures/dex/alpha.dex")
+    ])
+    .unwrap();
+    for descriptor in [
+        "Lfixtures/Gamma;->name:Ljava/lang/String;",
+        "Lfixtures/Alpha;->name:I",
+        "not-a-field",
+    ] {
+        let query = parse(&format!("SELECT DISTINCT m.descriptor AS descriptor FROM methods m JOIN method_field_accesses fa ON fa.method = m.descriptor WHERE fa.file_id = m.file_id AND fa.method_idx = m.method_idx AND fa.field = '{descriptor}' ORDER BY m.descriptor"));
+        let result = fast_descriptor::try_fast_descriptor_lookup(&query, &dataset, None)
+            .unwrap()
+            .unwrap();
+        assert!(result.rows.is_empty(), "{descriptor}");
+        assert!(dataset.files[0].field_descriptors.get().is_none());
+        assert!(dataset.files[0].method_descriptors.get().is_none());
+    }
+}
+
 fn parse(sql: &str) -> sqlparser::ast::Query {
     let statements =
         sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::SQLiteDialect {}, sql).unwrap();

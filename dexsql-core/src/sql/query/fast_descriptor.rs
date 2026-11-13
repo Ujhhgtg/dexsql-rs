@@ -41,6 +41,7 @@ struct StringNeed {
 
 #[derive(Debug, Clone, Default)]
 struct MethodFilter {
+    descriptors: Vec<String>,
     strings: Vec<StringNeed>,
     numbers: Vec<i64>,
     doubles: Vec<f64>,
@@ -67,7 +68,8 @@ struct MethodFilter {
 
 impl MethodFilter {
     fn is_empty(&self) -> bool {
-        self.strings.is_empty()
+        self.descriptors.is_empty()
+            && self.strings.is_empty()
             && self.numbers.is_empty()
             && self.doubles.is_empty()
             && self.opcode_count_min.is_none()
@@ -87,6 +89,7 @@ impl MethodFilter {
     }
 
     fn merge(&mut self, other: MethodFilter) {
+        self.descriptors.extend(other.descriptors);
         self.strings.extend(other.strings);
         self.numbers.extend(other.numbers);
         self.doubles.extend(other.doubles);
@@ -1101,7 +1104,32 @@ fn string_candidate_methods(file: &DexFile, need: &StringNeed) -> HashSet<u32> {
 }
 
 fn candidate_methods(file: &DexFile, filter: &MethodFilter) -> Option<HashSet<u32>> {
-    let mut candidate: Option<HashSet<u32>> = None;
+    if filter.descriptors.windows(2).any(|pair| pair[0] != pair[1]) {
+        return Some(HashSet::new());
+    }
+    let mut candidate: Option<HashSet<u32>> = if filter.descriptors.is_empty() {
+        None
+    } else {
+        Some(
+            filter
+                .descriptors
+                .iter()
+                .filter_map(|descriptor| {
+                    let parts = crate::dex::metadata::parse_method_descriptor(descriptor).ok()?;
+                    let class_idx = file.type_idx_for_descriptor(parts.class_descriptor)?;
+                    if !file.methods_by_class.is_empty() {
+                        return file.method_reference_for_type(class_idx, &parts);
+                    }
+                    file.methods.iter().enumerate().find_map(|(index, method)| {
+                        (method.class_idx as u32 == class_idx
+                            && file.string(method.name_idx) == parts.name
+                            && file.method_descriptor_direct(index as u32) == *descriptor)
+                            .then_some(index as u32)
+                    })
+                })
+                .collect(),
+        )
+    };
     for need in &filter.strings {
         let strings = string_candidate_methods(file, need);
         candidate = Some(match candidate {
@@ -1304,6 +1332,11 @@ fn add_predicate(filter: &mut MethodFilter, table: &str, pred: &Pred) -> Option<
             _ => return None,
         },
         "methods" => match pred.column.as_str() {
+            "descriptor" if matches!(pred.kind, PredKind::Eq) => {
+                let descriptor = pred.text()?;
+                crate::dex::metadata::parse_method_descriptor(descriptor).ok()?;
+                filter.descriptors.push(descriptor.to_owned());
+            }
             "access_flags" => match pred.kind {
                 PredKind::Flags(mask) => filter.flags.push((mask, pred.int()?)),
                 _ => return None,
@@ -1458,53 +1491,66 @@ fn access_using_type(opcode: u8) -> &'static str {
     }
 }
 
-fn field_access_methods(file: &DexFile, filter: &RelationAccessFilter) -> HashSet<u32> {
-    file.method_field_accesses
-        .iter()
-        .filter(|access| {
-            if !filter.fields.is_empty()
+fn field_access_methods(
+    file: &DexFile,
+    filter: &RelationAccessFilter,
+    candidates: Option<&HashSet<u32>>,
+) -> HashSet<u32> {
+    let matches = |access: &&crate::dex::MethodFieldRef| {
+        if candidates.is_some_and(|candidates| !candidates.contains(&access.method_idx)) {
+            return false;
+        }
+        if !filter.using_types.is_empty()
+            && !filter
+                .using_types
+                .iter()
+                .any(|value| value.as_str() == access_using_type(access.opcode))
+        {
+            return false;
+        }
+        if !filter.field_names.is_empty() || !filter.field_types.is_empty() {
+            let Some(parts) = file.field_parts(access.field_idx) else {
+                return false;
+            };
+            if !filter.field_names.is_empty()
                 && !filter
-                    .fields
+                    .field_names
                     .iter()
-                    .any(|value| value.as_str() == file.field_descriptor_ref(access.field_idx))
+                    .any(|value| value.as_str() == parts.name)
             {
                 return false;
             }
-            if !filter.using_types.is_empty()
+            if !filter.field_types.is_empty()
                 && !filter
-                    .using_types
+                    .field_types
                     .iter()
-                    .any(|value| value.as_str() == access_using_type(access.opcode))
+                    .any(|value| value.as_str() == parts.type_descriptor)
             {
                 return false;
             }
-            if !filter.field_names.is_empty() || !filter.field_types.is_empty() {
-                let Some((name, field_type)) =
-                    field_descriptor_parts(file.field_descriptor_ref(access.field_idx))
-                else {
-                    return false;
-                };
-                if !filter.field_names.is_empty()
-                    && !filter
-                        .field_names
-                        .iter()
-                        .any(|value| value.as_str() == name)
-                {
-                    return false;
-                }
-                if !filter.field_types.is_empty()
-                    && !filter
-                        .field_types
-                        .iter()
-                        .any(|value| value.as_str() == field_type)
-                {
-                    return false;
-                }
-            }
-            true
-        })
-        .map(|access| access.method_idx)
-        .collect()
+        }
+        true
+    };
+    if filter.fields.is_empty() {
+        file.method_field_accesses
+            .iter()
+            .filter(matches)
+            .map(|access| access.method_idx)
+            .collect()
+    } else {
+        filter
+            .fields
+            .iter()
+            .filter_map(|descriptor| {
+                let parts = crate::dex::metadata::parse_field_descriptor(descriptor).ok()?;
+                let class_idx = file.type_idx_for_descriptor(parts.class_descriptor)?;
+                file.field_reference_for_type(class_idx, &parts)
+            })
+            .flat_map(|field_idx| file.accesses_for_field(field_idx))
+            .filter(matches)
+            .map(|access| access.method_idx)
+            .collect()
+    }
 }
 
 fn other_join_alias(columns: &JoinColumns, alias: &str) -> Option<String> {
@@ -1919,25 +1965,15 @@ fn run_method_lookup(
         ds.files
             .par_iter()
             .map(|file| {
-                let mut allowed: Option<HashSet<u32>> = None;
+                let mut allowed: Option<HashSet<u32>> = (!filter.is_empty())
+                    .then(|| filtered_methods(file, &filter).into_iter().collect());
                 for unit in &access_filters {
-                    let methods = field_access_methods(file, unit);
-                    allowed = Some(match allowed {
-                        None => methods,
-                        Some(previous) => previous
-                            .into_iter()
-                            .filter(|method| methods.contains(method))
-                            .collect(),
-                    });
                     if allowed.as_ref().is_some_and(HashSet::is_empty) {
                         return Vec::new();
                     }
+                    allowed = Some(field_access_methods(file, unit, allowed.as_ref()));
                 }
-                let allowed = allowed.unwrap_or_default();
-                filtered_methods(file, &filter)
-                    .into_iter()
-                    .filter(|method| allowed.contains(method))
-                    .collect()
+                allowed.unwrap_or_default().into_iter().collect()
             })
             .collect()
     } else if class_unit_aliases.is_empty() {
@@ -3031,17 +3067,20 @@ fn class_fields_match(
             if used.contains(&field.field_idx) {
                 continue;
             }
-            let descriptor = file.field_descriptor_ref(field.field_idx);
-            let Some((name, field_type)) = field_descriptor_parts(descriptor) else {
+            let Some(parts) = file.field_parts(field.field_idx) else {
                 continue;
             };
-            if unit.name.as_deref().is_some_and(|value| value != name) {
+            if unit
+                .name
+                .as_deref()
+                .is_some_and(|value| value != parts.name)
+            {
                 continue;
             }
             if unit
                 .field_type
                 .as_deref()
-                .is_some_and(|value| value != field_type)
+                .is_some_and(|value| value != parts.type_descriptor)
             {
                 continue;
             }
@@ -3063,14 +3102,6 @@ fn class_fields_match(
     }
     let mut used = HashSet::new();
     match_unit(file, class, units, 0, &mut used)
-}
-
-/** Split a field descriptor ("Lpkg/Class;->name:Type;") into its name and type descriptor. */
-fn field_descriptor_parts(descriptor: &str) -> Option<(&str, &str)> {
-    let arrow = descriptor.find("->")?;
-    let rest = &descriptor[arrow + 2..];
-    let colon = rest.find(':')?;
-    Some((&rest[..colon], &rest[colon + 1..]))
 }
 
 fn run_field_lookup(
@@ -3257,50 +3288,49 @@ fn run_field_lookup(
                     return Vec::new();
                 }
             }
-            let fields = fields.unwrap_or_else(|| (0..file.fields.len() as u32).collect());
-            fields
-                .into_iter()
-                .filter(|field_idx| {
-                    let Some(field) = file.fields.get(*field_idx as usize) else {
-                        return false;
-                    };
-                    let class = file.type_descriptor(field.class_idx as u32);
-                    if !filter.names.is_empty()
-                        && !filter
-                            .names
-                            .iter()
-                            .any(|value| value == file.string(field.name_idx))
-                    {
+            let matches = |field_idx: &u32| {
+                let Some(field) = file.fields.get(*field_idx as usize) else {
+                    return false;
+                };
+                let class = file.type_descriptor(field.class_idx as u32);
+                if !filter.names.is_empty()
+                    && !filter
+                        .names
+                        .iter()
+                        .any(|value| value == file.string(field.name_idx))
+                {
+                    return false;
+                }
+                if !filter.classes.is_empty() && !filter.classes.iter().any(|value| value == class)
+                {
+                    return false;
+                }
+                if !filter.class_likes.is_empty()
+                    && !filter
+                        .class_likes
+                        .iter()
+                        .any(|need| plain_like_match(class, need))
+                {
+                    return false;
+                }
+                if !filter.types.is_empty() {
+                    let field_type = file.type_descriptor(field.type_idx as u32);
+                    if !filter.types.iter().any(|value| value == field_type) {
                         return false;
                     }
-                    if !filter.classes.is_empty()
-                        && !filter.classes.iter().any(|value| value == class)
-                    {
-                        return false;
-                    }
-                    if !filter.class_likes.is_empty()
-                        && !filter
-                            .class_likes
-                            .iter()
-                            .any(|need| plain_like_match(class, need))
-                    {
-                        return false;
-                    }
-                    if !filter.types.is_empty() {
-                        let field_type = file.type_descriptor(field.type_idx as u32);
-                        if !filter.types.iter().any(|value| value == field_type) {
-                            return false;
-                        }
-                    }
-                    true
-                })
-                .collect()
+                }
+                true
+            };
+            match fields {
+                Some(fields) => fields.into_iter().filter(matches).collect(),
+                None => (0..file.fields.len() as u32).filter(matches).collect(),
+            }
         })
         .collect();
     let mut rows = Vec::new();
     for (file, fields) in ds.files.iter().zip(files.iter()) {
         for field in fields {
-            rows.push(file.field_descriptor(*field));
+            rows.push(file.field_descriptor_direct(*field));
         }
     }
     Ok(apply_limit(rows, label, limit, cli_limit))

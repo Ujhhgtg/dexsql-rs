@@ -327,9 +327,9 @@ fn split_type_descriptors(mut input: &str) -> Result<Vec<&str>, String> {
 /// Lazy relation indexes attached to one [DexFile].
 ///
 /// The relation vectors themselves keep their load order (code order); each
-/// index maps an owning method index to a contiguous row range. Indexes are
-/// built on the first metadata read that needs them and are shared by all
-/// threads afterwards.
+/// index maps an owning method to its row range or a referenced field to row
+/// ordinals. Indexes are built on the first read that needs them and are shared
+/// by all threads afterwards.
 #[derive(Debug, Default, Clone)]
 pub struct MetadataIndexes {
     invokes: OnceLock<Arc<RangeIndex>>,
@@ -337,6 +337,51 @@ pub struct MetadataIndexes {
     using_strings: OnceLock<Arc<RangeIndex>>,
     using_numbers: OnceLock<Arc<RangeIndex>>,
     using_fields: OnceLock<Arc<RangeIndex>>,
+    field_accesses: OnceLock<Arc<FieldAccessIndex>>,
+}
+
+#[derive(Debug)]
+struct FieldAccessIndex {
+    offsets: Vec<u32>,
+    rows: Vec<u32>,
+}
+
+impl FieldAccessIndex {
+    fn build(rows: &[MethodFieldRef], field_count: usize) -> Self {
+        let mut offsets = vec![0u32; field_count + 1];
+        for row in rows {
+            if (row.field_idx as usize) < field_count {
+                offsets[row.field_idx as usize + 1] += 1;
+            }
+        }
+        for index in 1..offsets.len() {
+            offsets[index] += offsets[index - 1];
+        }
+        let mut positions = offsets[..field_count].to_vec();
+        let mut ordered = vec![0; offsets[field_count] as usize];
+        for (ordinal, row) in rows.iter().enumerate() {
+            let Some(position) = positions.get_mut(row.field_idx as usize) else {
+                continue;
+            };
+            ordered[*position as usize] = ordinal as u32;
+            *position += 1;
+        }
+        Self {
+            offsets,
+            rows: ordered,
+        }
+    }
+
+    fn rows(&self, field_idx: u32) -> &[u32] {
+        let Some(bounds) = self
+            .offsets
+            .get(field_idx as usize..)
+            .and_then(|tail| tail.get(..2))
+        else {
+            return &[];
+        };
+        &self.rows[bounds[0] as usize..bounds[1] as usize]
+    }
 }
 
 impl MetadataIndexes {
@@ -852,6 +897,18 @@ impl DexFile {
                 &rows[start..end]
             }
         }
+    }
+
+    pub fn accesses_for_field(&self, field_idx: u32) -> impl Iterator<Item = &MethodFieldRef> {
+        let rows = &self.method_field_accesses;
+        let index = self
+            .meta
+            .field_accesses
+            .get_or_init(|| Arc::new(FieldAccessIndex::build(rows, self.fields.len())));
+        index
+            .rows(field_idx)
+            .iter()
+            .map(move |ordinal| &rows[*ordinal as usize])
     }
 }
 
@@ -1423,6 +1480,51 @@ fn dexkit_entry_rank(entry_name: &str, index: usize) -> (u32, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn field_access_index_preserves_interleaved_reads_writes_and_duplicates() {
+        let rows = [
+            MethodFieldRef {
+                method_idx: 7,
+                field_idx: 2,
+                opcode: 0x52,
+            },
+            MethodFieldRef {
+                method_idx: 1,
+                field_idx: 0,
+                opcode: 0x59,
+            },
+            MethodFieldRef {
+                method_idx: 7,
+                field_idx: 2,
+                opcode: 0x59,
+            },
+            MethodFieldRef {
+                method_idx: 4,
+                field_idx: 1,
+                opcode: 0x60,
+            },
+            MethodFieldRef {
+                method_idx: 1,
+                field_idx: 0,
+                opcode: 0x59,
+            },
+        ];
+        let index = FieldAccessIndex::build(&rows, 4);
+        assert_eq!(index.rows(0), &[1, 4]);
+        assert_eq!(index.rows(1), &[3]);
+        assert_eq!(index.rows(2), &[0, 2]);
+        assert!(index.rows(3).is_empty());
+        assert!(index.rows(4).is_empty());
+        assert!(index.rows(u32::MAX).is_empty());
+        assert!(FieldAccessIndex::build(&[], 0).rows(0).is_empty());
+        let invalid = [MethodFieldRef {
+            method_idx: 0,
+            field_idx: u32::MAX,
+            opcode: 0x52,
+        }];
+        assert!(FieldAccessIndex::build(&invalid, 1).rows(0).is_empty());
+    }
 
     #[test]
     fn parses_method_descriptors() {
