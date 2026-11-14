@@ -42,7 +42,9 @@ mod param_pattern;
 mod physical_methods;
 mod relational;
 mod scalar_functions;
+mod semijoin;
 mod streaming;
+mod subquery_memo;
 mod typed;
 
 pub use error::{render_caused_by, render_flat_chain, DexSqlError};
@@ -123,6 +125,7 @@ struct CachedTable {
 /// count-only request into a full cache decode.
 #[derive(Debug, Default)]
 pub struct NamedCaches {
+    subqueries: subquery_memo::Memo,
     definitions: RefCell<HashMap<String, String>>,
     tables: RefCell<HashMap<String, Arc<CachedTable>>>,
     loading: RefCell<HashSet<String>>,
@@ -188,6 +191,7 @@ impl NamedCaches {
         // A redefinition invalidates any materialized rows from the previous
         // definition of the same name.
         self.tables.borrow_mut().remove(&name);
+        self.subqueries.clear();
         self.definitions
             .borrow_mut()
             .insert(name.clone(), query.to_owned());
@@ -206,6 +210,7 @@ impl NamedCaches {
     /// the parent session.
     fn child_scope(&self) -> NamedCaches {
         NamedCaches {
+            subqueries: subquery_memo::Memo::default(),
             definitions: RefCell::new(self.definitions.borrow().clone()),
             tables: RefCell::new(self.tables.borrow().clone()),
             loading: RefCell::new(HashSet::new()),
@@ -217,6 +222,7 @@ impl NamedCaches {
     /// Install an already-materialized result as a scope-local table,
     /// shadowing any same-named definition.
     fn install_materialized(&self, name: &str, typed: (Vec<String>, Vec<Vec<Scalar>>)) {
+        self.subqueries.clear();
         let (columns, rows) = typed;
         let table = Arc::new(CachedTable { columns, rows });
         self.definitions
@@ -5190,6 +5196,7 @@ fn execute_query_rows(
     needs_method_opcode: bool,
 ) -> Result<SetRows, String> {
     let _membership_scope = membership::Scope::new();
+    let _subquery_scope = named_caches.subqueries.scope();
     let fused_query = if !cache_shadows_relation(&query.to_string(), named_caches) {
         derived::query(query)
     } else {
@@ -5719,9 +5726,8 @@ fn desugar_select(
             *expr = desugar_expr(expr, ds, source_dataset, named_caches, &outer_aliases)?;
         }
     }
-    if let Some(selection) = &mut select.selection {
-        *selection = desugar_expr(selection, ds, source_dataset, named_caches, &outer_aliases)?;
-    }
+    select.selection =
+        semijoin::selection(select, ds, source_dataset, named_caches, &outer_aliases)?;
     if let Some(having) = &mut select.having {
         *having = desugar_expr(having, ds, source_dataset, named_caches, &outer_aliases)?;
     }
@@ -5833,6 +5839,15 @@ fn desugar_expr(
                     )? {
                         return Ok(Some(expr));
                     }
+                    let sql = subquery.to_string();
+                    if let Some(values) = named_caches.subqueries.get(&sql) {
+                        return Ok(Some(membership::register_shared_membership(
+                            HashMap::from([(membership::KeyTuple::Empty, values)]),
+                            *negated,
+                            Vec::new(),
+                            value,
+                        )));
+                    }
                     let (_, mut rows) = execute_query_rows(
                         subquery,
                         ds,
@@ -5870,7 +5885,9 @@ fn desugar_expr(
                             charge_materialized(bytes)?;
                         }
                     }
-                    Ok(Some(membership::register_membership(
+                    let values = Arc::new(values);
+                    named_caches.subqueries.insert(sql, values.clone(), bytes);
+                    Ok(Some(membership::register_shared_membership(
                         std::collections::HashMap::from([(membership::KeyTuple::Empty, values)]),
                         *negated,
                         Vec::new(),

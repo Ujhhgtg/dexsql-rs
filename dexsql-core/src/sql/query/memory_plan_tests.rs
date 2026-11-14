@@ -121,6 +121,38 @@ fn missing_field_access_descriptors_do_not_materialize_descriptor_tables() {
     }
 }
 
+#[test]
+fn field_flag_lookup_requires_local_definition_identity() {
+    let dataset = Dataset::load_paths(&[
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../fixtures/dex/alpha.dex")
+    ])
+    .unwrap();
+    let sql = "SELECT DISTINCT f.descriptor AS descriptor FROM fields f JOIN class_fields cf ON cf.field_descriptor=f.descriptor WHERE f.class_descriptor='Lfixtures/Alpha;' AND (cf.access_flags & 1)=1 AND cf.file_id=f.file_id AND cf.field_idx=f.field_idx ORDER BY f.descriptor";
+    let query = parse(sql);
+    let actual = fast_descriptor::try_fast_descriptor_lookup(&query, &dataset, None)
+        .unwrap()
+        .unwrap();
+    let expected = execute_query(
+        &query,
+        &dataset,
+        Some(&dataset),
+        &NamedCaches::default(),
+        None,
+        false,
+    )
+    .unwrap();
+    assert_eq!(actual.rows, expected.rows);
+    assert!(!actual.rows.is_empty());
+    for identity in [" AND cf.file_id=f.file_id", " AND cf.field_idx=f.field_idx"] {
+        assert!(fast_descriptor::try_fast_descriptor_lookup(
+            &parse(&sql.replace(identity, "")),
+            &dataset,
+            None
+        )
+        .is_none());
+    }
+}
+
 fn parse(sql: &str) -> sqlparser::ast::Query {
     let statements =
         sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::SQLiteDialect {}, sql).unwrap();

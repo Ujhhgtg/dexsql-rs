@@ -208,6 +208,7 @@ pub(super) fn result(
 
 /// Distinct membership values retain neither projected rows nor duplicate cells.
 /// The empty bit is separate from NULL membership for SQL's empty-set rules.
+#[derive(Debug)]
 pub(super) struct Values {
     keys: HashSet<Key>,
     saw_null: bool,
@@ -280,7 +281,7 @@ impl Compiled {
 /// One lookup replaces every outer-row execution of the inner query.
 enum Lookup {
     Membership {
-        groups: HashMap<KeyTuple, Values>,
+        groups: HashMap<KeyTuple, Arc<Values>>,
         negated: bool,
     },
     Scalar {
@@ -332,6 +333,23 @@ pub(super) fn register_rows(keys: HashSet<KeyTuple>, negated: bool, values: Vec<
 
 pub(super) fn register_membership(
     groups: HashMap<KeyTuple, Values>,
+    negated: bool,
+    keys: Vec<Expr>,
+    value: Expr,
+) -> Expr {
+    register_shared_membership(
+        groups
+            .into_iter()
+            .map(|(key, values)| (key, Arc::new(values)))
+            .collect(),
+        negated,
+        keys,
+        value,
+    )
+}
+
+pub(super) fn register_shared_membership(
+    groups: HashMap<KeyTuple, Arc<Values>>,
     negated: bool,
     keys: Vec<Expr>,
     value: Expr,
@@ -579,6 +597,14 @@ pub(super) fn evaluate(
 }
 
 pub(super) fn text_candidates(expr: &Expr, alias: &str, column: &str) -> Option<Vec<String>> {
+    let matches_column = |expr: &Expr| match expr {
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            parts[0].value.eq_ignore_ascii_case(alias)
+                && parts[1].value.eq_ignore_ascii_case(column)
+        }
+        Expr::Identifier(name) => name.value.eq_ignore_ascii_case(column),
+        _ => false,
+    };
     match expr {
         Expr::Nested(inner) => return text_candidates(inner, alias, column),
         Expr::BinaryOp {
@@ -596,6 +622,47 @@ pub(super) fn text_candidates(expr: &Expr, alias: &str, column: &str) -> Option<
                 }),
                 (left, right) => left.or(right),
             };
+        }
+        Expr::BinaryOp {
+            left,
+            op: sqlparser::ast::BinaryOperator::Or,
+            right,
+        } => {
+            let mut values = text_candidates(left, alias, column)?;
+            values.extend(text_candidates(right, alias, column)?);
+            values.sort_unstable();
+            values.dedup();
+            return Some(values);
+        }
+        Expr::BinaryOp {
+            left,
+            op: sqlparser::ast::BinaryOperator::Eq,
+            right,
+        } => {
+            let value = if matches_column(left) {
+                right
+            } else if matches_column(right) {
+                left
+            } else {
+                return None;
+            };
+            return match literal(value)? {
+                Scalar::Text(value) => Some(vec![value.to_string()]),
+                _ => None,
+            };
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } if matches_column(expr) => {
+            return list
+                .iter()
+                .map(|expr| match literal(expr)? {
+                    Scalar::Text(value) => Some(value.to_string()),
+                    _ => None,
+                })
+                .collect();
         }
         _ => {}
     }

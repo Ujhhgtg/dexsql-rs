@@ -1130,6 +1130,84 @@ fn candidate_methods(file: &DexFile, filter: &MethodFilter) -> Option<HashSet<u3
                 .collect(),
         )
     };
+    if !file.methods_by_class.is_empty() {
+        let mut restrict = |indices: Vec<u32>| {
+            let indices = indices.into_iter().collect::<HashSet<_>>();
+            candidate = Some(match candidate.take() {
+                None => indices,
+                Some(previous) => previous.intersection(&indices).copied().collect(),
+            });
+        };
+        if !filter.names.is_empty() {
+            restrict(
+                filter
+                    .names
+                    .iter()
+                    .filter_map(|name| file.find_string_idx(name))
+                    .flat_map(|name| {
+                        file.methods_by_name
+                            .get(&name)
+                            .into_iter()
+                            .flatten()
+                            .copied()
+                    })
+                    .collect(),
+            );
+        }
+        if !filter.classes.is_empty() {
+            restrict(
+                filter
+                    .classes
+                    .iter()
+                    .filter_map(|class| file.type_idx_for_descriptor(class))
+                    .flat_map(|class| {
+                        file.methods_by_class
+                            .get(&class)
+                            .into_iter()
+                            .flatten()
+                            .copied()
+                    })
+                    .collect(),
+            );
+        }
+        if !filter.returns.is_empty()
+            && filter
+                .returns
+                .iter()
+                .all(|need| need.mode == LikeMode::Equal && !need.case_insensitive)
+        {
+            restrict(
+                filter
+                    .returns
+                    .iter()
+                    .filter_map(|need| file.type_idx_for_descriptor(&need.value))
+                    .flat_map(|returns| {
+                        file.methods_by_return
+                            .get(&returns)
+                            .into_iter()
+                            .flatten()
+                            .copied()
+                    })
+                    .collect(),
+            );
+        }
+        if !filter.param_counts.is_empty() {
+            restrict(
+                filter
+                    .param_counts
+                    .iter()
+                    .filter_map(|count| u32::try_from(*count).ok())
+                    .flat_map(|count| {
+                        file.methods_by_param_count
+                            .get(&count)
+                            .into_iter()
+                            .flatten()
+                            .copied()
+                    })
+                    .collect(),
+            );
+        }
+    }
     for need in &filter.strings {
         let strings = string_candidate_methods(file, need);
         candidate = Some(match candidate {
@@ -2985,6 +3063,7 @@ struct FieldFilter {
     classes: Vec<String>,
     class_likes: Vec<StringNeed>,
     types: Vec<String>,
+    flags: Vec<(i64, i64)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3122,6 +3201,7 @@ fn class_fields_match(
 }
 
 fn run_field_lookup(
+    select: &Select,
     ds: &Dataset,
     base_alias: &str,
     factors: &[Factor],
@@ -3139,9 +3219,48 @@ fn run_field_lookup(
     let mut method_aliases: Vec<String> = Vec::new();
     let mut method_by_access: Vec<(String, String)> = Vec::new();
     let mut literal_aliases: Vec<(String, String)> = Vec::new();
+    let mut definition_aliases = Vec::new();
     for (index, columns) in joins.iter().enumerate() {
         let factor = &factors[index + 1];
         match factor.table.as_str() {
+            "class_fields" => {
+                let matches = |side: &(Option<String>, String), alias: &str, column: &str| {
+                    side.0.as_deref() == Some(alias) && side.1 == column
+                };
+                if !((matches(&columns.0, base_alias, "descriptor")
+                    && matches(&columns.1, &factor.alias, "field_descriptor"))
+                    || (matches(&columns.1, base_alias, "descriptor")
+                        && matches(&columns.0, &factor.alias, "field_descriptor")))
+                {
+                    return Err("unsupported fast field definition join".into());
+                }
+                let mut atoms = Vec::new();
+                if let Some(selection) = &select.selection {
+                    flatten_and(selection, &mut atoms);
+                }
+                for column in ["file_id", "field_idx"] {
+                    let equality = atoms.iter().any(|atom| {
+                        let Expr::BinaryOp {
+                            left,
+                            op: BinaryOperator::Eq,
+                            right,
+                        } = atom
+                        else {
+                            return false;
+                        };
+                        let left = column_expr(left);
+                        let right = column_expr(right);
+                        let base = Some((Some(base_alias.to_owned()), column.to_owned()));
+                        let definition = Some((Some(factor.alias.clone()), column.to_owned()));
+                        (left == base && right == definition)
+                            || (left == definition && right == base)
+                    });
+                    if !equality {
+                        return Err("field definition join requires local identity".into());
+                    }
+                }
+                definition_aliases.push(factor.alias.clone());
+            }
             "method_strings" | "method_using_numbers" => {
                 if !is_method_string_join(columns) {
                     return Err("unsupported fast field join".into());
@@ -3214,6 +3333,18 @@ fn run_field_lookup(
         }
         let table = table_for(factors, alias).ok_or("unknown field predicate alias")?;
         match table {
+            "class_fields"
+                if definition_aliases
+                    .iter()
+                    .any(|definition| definition == alias) =>
+            {
+                match pred.kind {
+                    PredKind::Flags(mask) if pred.column == "access_flags" => filter
+                        .flags
+                        .push((mask, pred.int().ok_or("bad field flags")?)),
+                    _ => return Err("unsupported field definition predicate".into()),
+                }
+            }
             "method_field_accesses" => {
                 if pred.column != "using_type" || !matches!(pred.kind, PredKind::Eq) {
                     return Err("unsupported fast field access predicate".into());
@@ -3333,6 +3464,18 @@ fn run_field_lookup(
                 if !filter.types.is_empty() {
                     let field_type = file.type_descriptor(field.type_idx as u32);
                     if !filter.types.iter().any(|value| value == field_type) {
+                        return false;
+                    }
+                }
+                if !definition_aliases.is_empty() {
+                    let Some(flags) = file.defined_field_flags(*field_idx) else {
+                        return false;
+                    };
+                    if !filter
+                        .flags
+                        .iter()
+                        .all(|(mask, expected)| flags as i64 & mask == *expected)
+                    {
                         return false;
                     }
                 }
@@ -3492,6 +3635,7 @@ pub(crate) fn try_fast_descriptor_lookup(
             cli_limit,
         ),
         Target::Field => run_field_lookup(
+            select,
             ds,
             &base_alias,
             &factors,
