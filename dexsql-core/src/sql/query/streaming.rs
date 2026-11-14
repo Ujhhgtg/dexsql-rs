@@ -381,6 +381,9 @@ pub(super) fn supports_table(table: &str) -> bool {
             | "proto_params"
             | "field_ids"
             | "method_ids"
+            | "class_methods"
+            | "class_fields"
+            | "class_interfaces"
     )
 }
 
@@ -439,6 +442,66 @@ pub(super) fn execute(
         .as_ref()
         .map(Prepared::new)
         .filter(|expr| expr.source_safe() && expr.source_columns_valid(&schema, alias));
+    let member_candidates = |column| {
+        select
+            .selection
+            .as_ref()
+            .and_then(|expr| membership::text_candidates(expr, alias, column))
+            .filter(|descriptors| {
+                descriptors.iter().all(|descriptor| {
+                    crate::dex::metadata::parse_method_descriptor(descriptor).is_ok()
+                })
+            })
+    };
+    let method_candidates = if table == "methods" {
+        let indexed = fast_descriptor::method_candidates(select, ds);
+        let descriptors = member_candidates("descriptor");
+        match descriptors {
+            None => indexed,
+            Some(descriptors) => {
+                let parts = descriptors
+                    .iter()
+                    .filter_map(|value| crate::dex::metadata::parse_method_descriptor(value).ok())
+                    .collect::<Vec<_>>();
+                Some(
+                    ds.files
+                        .iter()
+                        .enumerate()
+                        .map(|(file_index, file)| {
+                            let mut indices = parts
+                                .iter()
+                                .filter_map(|part| {
+                                    let class =
+                                        file.type_idx_for_descriptor(part.class_descriptor)?;
+                                    file.method_reference_for_type(class, part)
+                                })
+                                .filter(|index| {
+                                    indexed.as_ref().is_none_or(|sets| {
+                                        sets[file_index].binary_search(index).is_ok()
+                                    })
+                                })
+                                .collect::<Vec<_>>();
+                            indices.sort_unstable();
+                            indices.dedup();
+                            indices
+                        })
+                        .collect(),
+                )
+            }
+        }
+    } else {
+        None
+    };
+    let call_targets = if table == "method_calls" {
+        member_candidates("callee")
+    } else {
+        None
+    };
+    let call_sources = if table == "method_calls" {
+        member_candidates("method")
+    } else {
+        None
+    };
     execute_with_input(
         query,
         select,
@@ -448,14 +511,17 @@ pub(super) fn execute(
         source_order_prefix(query, select, ds, &table, alias),
         |columns, visit| {
             let columns = columns.iter().map(String::as_str).collect::<Vec<_>>();
-            visit_source_filtered(
+            visit_source_records_filtered(
                 ds,
                 &table,
                 alias,
                 &columns,
                 scan_predicates.as_deref(),
                 source_filter.as_ref(),
-                visit,
+                method_candidates.as_deref(),
+                call_targets.as_deref(),
+                call_sources.as_deref(),
+                |row, _, _| visit(row),
             )
         },
     )
@@ -965,6 +1031,9 @@ pub(super) enum Source<'a> {
     },
     Method(u32),
     Class(&'a ClassInfo),
+    ClassMethod(&'a ClassInfo, usize),
+    ClassField(&'a ClassInfo, usize),
+    ClassInterface(&'a ClassInfo, usize),
     Field(u32),
     String(&'a crate::dex::MethodStringRef),
     Call(&'a crate::dex::MethodCallRef),
@@ -1141,6 +1210,57 @@ impl<'a> Cells<'a> {
         };
         if matches!(column, "file_id" | "string_pool_id") {
             return Scalar::Int(self.file.file_id as i64);
+        }
+        match source {
+            Source::ClassMethod(class, position) => {
+                let member = &class.methods[position];
+                let parts = self.file.method_parts(member.method_idx).unwrap();
+                return match column {
+                    "class_idx" => Scalar::Int(class.class_idx as i64),
+                    "class_descriptor" => Scalar::text(self.file.type_descriptor(class.class_idx)),
+                    "method_idx" => Scalar::Int(member.method_idx as i64),
+                    "method_name" => Scalar::text(parts.name),
+                    "method_descriptor" => Scalar::text(parts.descriptor()),
+                    "kind" => Scalar::text(if member.is_direct {
+                        "direct"
+                    } else {
+                        "virtual"
+                    }),
+                    "access_flags" => Scalar::Int(member.access_flags as i64),
+                    _ => Scalar::Null,
+                };
+            }
+            Source::ClassField(class, position) => {
+                let member = &class.fields[position];
+                let parts = self.file.field_parts(member.field_idx).unwrap();
+                return match column {
+                    "class_idx" => Scalar::Int(class.class_idx as i64),
+                    "class_descriptor" => Scalar::text(self.file.type_descriptor(class.class_idx)),
+                    "field_idx" => Scalar::Int(member.field_idx as i64),
+                    "field_name" => Scalar::text(parts.name),
+                    "field_type" => Scalar::text(parts.type_descriptor),
+                    "field_descriptor" => Scalar::text(parts.descriptor()),
+                    "kind" => Scalar::text(if member.is_static {
+                        "static"
+                    } else {
+                        "instance"
+                    }),
+                    "access_flags" => Scalar::Int(member.access_flags as i64),
+                    _ => Scalar::Null,
+                };
+            }
+            Source::ClassInterface(class, position) => {
+                let interface = class.interfaces[position] as u32;
+                return match column {
+                    "class_idx" => Scalar::Int(class.class_idx as i64),
+                    "class_descriptor" => Scalar::text(self.file.type_descriptor(class.class_idx)),
+                    "ordinal" => Scalar::Int(position as i64),
+                    "interface_type_idx" => Scalar::Int(interface as i64),
+                    "interface_descriptor" => Scalar::text(self.file.type_descriptor(interface)),
+                    _ => Scalar::Null,
+                };
+            }
+            _ => {}
         }
         match source {
             Source::File => {
@@ -1464,6 +1584,9 @@ fn visit_source_filtered(
         columns,
         predicates,
         filter,
+        None,
+        None,
+        None,
         |row, _, _| visit(row),
     )
 }
@@ -1476,7 +1599,9 @@ pub(super) fn visit_source_records<'a>(
     predicates: Option<&[PushPredicate]>,
     visit: impl FnMut(&RelRow, usize, Source<'a>) -> Result<bool, String>,
 ) -> Result<(), String> {
-    visit_source_records_filtered(ds, table, alias, columns, predicates, None, visit)
+    visit_source_records_filtered(
+        ds, table, alias, columns, predicates, None, None, None, None, visit,
+    )
 }
 
 fn source_matches(
@@ -1540,6 +1665,9 @@ fn visit_source_records_filtered<'a>(
     columns: &[&str],
     predicates: Option<&[PushPredicate]>,
     filter: Option<&Prepared>,
+    method_candidates: Option<&[Vec<u32>]>,
+    call_targets: Option<&[String]>,
+    call_sources: Option<&[String]>,
     mut visit: impl FnMut(&RelRow, usize, Source<'a>) -> Result<bool, String>,
 ) -> Result<(), String> {
     if table == "method_strings" {
@@ -1653,7 +1781,13 @@ fn visit_source_records_filtered<'a>(
                 }
             }
             "methods" | "method_ids" => {
-                for index in 0..file.methods.len() as u32 {
+                let indices: Box<dyn Iterator<Item = u32>> =
+                    if let Some(methods) = method_candidates {
+                        Box::new(methods[file_index].iter().copied())
+                    } else {
+                        Box::new(0..file.methods.len() as u32)
+                    };
+                for index in indices {
                     if consume(Source::Method(index))? {
                         return Ok(());
                     }
@@ -1663,6 +1797,25 @@ fn visit_source_records_filtered<'a>(
                 for class in &file.classes {
                     if consume(Source::Class(class))? {
                         return Ok(());
+                    }
+                }
+            }
+            "class_methods" | "class_fields" | "class_interfaces" => {
+                for class in &file.classes {
+                    let count = match table {
+                        "class_methods" => class.methods.len(),
+                        "class_fields" => class.fields.len(),
+                        _ => class.interfaces.len(),
+                    };
+                    for position in 0..count {
+                        let source = match table {
+                            "class_methods" => Source::ClassMethod(class, position),
+                            "class_fields" => Source::ClassField(class, position),
+                            _ => Source::ClassInterface(class, position),
+                        };
+                        if consume(source)? {
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -1681,9 +1834,47 @@ fn visit_source_records_filtered<'a>(
                 }
             }
             "method_calls" => {
-                for reference in &file.method_calls {
-                    if consume(Source::Call(reference))? {
-                        return Ok(());
+                if call_targets.is_some() || call_sources.is_some() {
+                    let resolve = |descriptors: &[String]| -> HashSet<u32> {
+                        descriptors
+                            .iter()
+                            .filter_map(|descriptor| {
+                                let parts =
+                                    crate::dex::metadata::parse_method_descriptor(descriptor)
+                                        .ok()?;
+                                let class = file.type_idx_for_descriptor(parts.class_descriptor)?;
+                                file.method_reference_for_type(class, &parts)
+                            })
+                            .collect()
+                    };
+                    let targets = call_targets.map(resolve);
+                    let methods = if let Some(sources) = call_sources {
+                        resolve(sources)
+                    } else {
+                        targets
+                            .as_ref()
+                            .unwrap()
+                            .iter()
+                            .flat_map(|callee| file.callers_for_method(*callee))
+                            .collect()
+                    };
+                    let mut methods = methods.into_iter().collect::<Vec<_>>();
+                    methods.sort_unstable();
+                    for method in methods {
+                        for reference in file.invokes_for_method(method) {
+                            if targets.as_ref().is_none_or(|targets| {
+                                targets.contains(&reference.callee_method_idx)
+                            }) && consume(Source::Call(reference))?
+                            {
+                                return Ok(());
+                            }
+                        }
+                    }
+                } else {
+                    for reference in &file.method_calls {
+                        if consume(Source::Call(reference))? {
+                            return Ok(());
+                        }
                     }
                 }
             }

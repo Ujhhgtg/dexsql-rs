@@ -578,6 +578,77 @@ pub(super) fn evaluate(
     })())
 }
 
+pub(super) fn text_candidates(expr: &Expr, alias: &str, column: &str) -> Option<Vec<String>> {
+    match expr {
+        Expr::Nested(inner) => return text_candidates(inner, alias, column),
+        Expr::BinaryOp {
+            left,
+            op: sqlparser::ast::BinaryOperator::And,
+            right,
+        } => {
+            let left = text_candidates(left, alias, column);
+            let right = text_candidates(right, alias, column);
+            return match (left, right) {
+                (Some(left), Some(right)) => Some(if left.len() <= right.len() {
+                    left
+                } else {
+                    right
+                }),
+                (left, right) => left.or(right),
+            };
+        }
+        _ => {}
+    }
+    let Expr::Function(function) = expr else {
+        return None;
+    };
+    if function.name.0.len() != 1 || function.name.0[0].as_ident()?.value != LOOKUP_NAME {
+        return None;
+    }
+    let FunctionArguments::List(args) = &function.args else {
+        return None;
+    };
+    let [FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(index))), FunctionArg::Unnamed(FunctionArgExpr::Expr(value))] =
+        args.args.as_slice()
+    else {
+        return None;
+    };
+    let matches = match value {
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            parts[0].value.eq_ignore_ascii_case(alias)
+                && parts[1].value.eq_ignore_ascii_case(column)
+        }
+        Expr::Identifier(name) => name.value.eq_ignore_ascii_case(column),
+        _ => false,
+    };
+    if !matches {
+        return None;
+    }
+    let Value::Number(index, _) = &index.value else {
+        return None;
+    };
+    let index = index.parse::<usize>().ok()?;
+    LOOKUPS.with(|lookups| {
+        let lookups = lookups.borrow();
+        let Lookup::Membership {
+            groups,
+            negated: false,
+        } = lookups.get(index)?
+        else {
+            return None;
+        };
+        let values = groups.get(&KeyTuple::Empty)?;
+        values
+            .keys
+            .iter()
+            .map(|value| match value {
+                Key::Text(value) => Some(value.to_string()),
+                _ => None,
+            })
+            .collect()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{compare_scalar, eval_bool};

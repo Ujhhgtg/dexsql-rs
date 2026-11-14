@@ -5202,6 +5202,22 @@ fn execute_query_rows(
         None => None,
     };
     let caches = scope.as_ref().unwrap_or(named_caches);
+    if source_dataset.is_some()
+        && query.with.is_none()
+        && !cache_shadows_relation(&query.to_string(), caches)
+    {
+        if let Some(result) = fast_descriptor::try_fast_descriptor_lookup(query, ds, cli_limit) {
+            let result = result?;
+            return Ok((
+                result.columns,
+                result
+                    .rows
+                    .into_iter()
+                    .map(|row| row.into_iter().map(Scalar::text).collect())
+                    .collect(),
+            ));
+        }
+    }
     match query.body.as_ref() {
         SetExpr::Select(select) => {
             let mut select = select.clone();
@@ -8343,6 +8359,11 @@ fn scan_class_fields(
                 row.put(alias, "field_idx", Scalar::Int(defined.field_idx as i64));
                 row.put(
                     alias,
+                    "field_type",
+                    Scalar::text(file.type_descriptor(field.type_idx as u32)),
+                );
+                row.put(
+                    alias,
                     "field_name",
                     Scalar::text(file.string(field.name_idx)),
                 );
@@ -8384,6 +8405,11 @@ fn scan_class_interfaces(
                 let mut row = RelRow::with_capacity(5);
                 row.put(alias, "file_id", Scalar::Int(file.file_id as i64));
                 row.put(alias, "class_idx", Scalar::Int(class.class_idx as i64));
+                row.put(
+                    alias,
+                    "class_descriptor",
+                    Scalar::text(file.type_descriptor(class.class_idx)),
+                );
                 row.put(alias, "ordinal", Scalar::Int(ordinal as i64));
                 row.put(alias, "interface_type_idx", Scalar::Int(*type_idx as i64));
                 row.put(

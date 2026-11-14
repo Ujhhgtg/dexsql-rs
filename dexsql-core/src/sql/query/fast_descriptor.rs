@@ -1472,6 +1472,11 @@ fn access_filter_for_alias(
                     .field_types
                     .push(pred.text().ok_or("bad field access type")?.to_owned());
             }
+            "field_class" if matches!(pred.kind, PredKind::Eq) => {
+                filter
+                    .field_classes
+                    .push(pred.text().ok_or("bad field access class")?.to_owned());
+            }
             "file_id" | "method_idx" => {}
             _ => return Err("unsupported fast field access predicate".into()),
         }
@@ -1508,7 +1513,10 @@ fn field_access_methods(
         {
             return false;
         }
-        if !filter.field_names.is_empty() || !filter.field_types.is_empty() {
+        if !filter.field_names.is_empty()
+            || !filter.field_types.is_empty()
+            || !filter.field_classes.is_empty()
+        {
             let Some(parts) = file.field_parts(access.field_idx) else {
                 return false;
             };
@@ -1525,6 +1533,14 @@ fn field_access_methods(
                     .field_types
                     .iter()
                     .any(|value| value.as_str() == parts.type_descriptor)
+            {
+                return false;
+            }
+            if !filter.field_classes.is_empty()
+                && !filter
+                    .field_classes
+                    .iter()
+                    .any(|value| value == parts.class_descriptor)
             {
                 return false;
             }
@@ -2984,6 +3000,7 @@ struct RelationAccessFilter {
     fields: Vec<String>,
     field_names: Vec<String>,
     field_types: Vec<String>,
+    field_classes: Vec<String>,
     using_types: Vec<String>,
 }
 
@@ -3334,6 +3351,48 @@ fn run_field_lookup(
         }
     }
     Ok(apply_limit(rows, label, limit, cli_limit))
+}
+
+pub(super) fn method_candidates(select: &Select, ds: &Dataset) -> Option<Vec<Vec<u32>>> {
+    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+        return None;
+    }
+    let (alias, table) = table_factor(&select.from[0].relation)?;
+    if table != "methods" {
+        return None;
+    }
+    let mut atoms = Vec::new();
+    flatten_and(select.selection.as_ref()?, &mut atoms);
+    let mut filter = MethodFilter::default();
+    for atom in atoms {
+        let mut single = select.clone();
+        single.selection = Some(atom.clone());
+        let Some((predicates, _)) = parse_predicates(&single) else {
+            continue;
+        };
+        for predicate in predicates {
+            if predicate
+                .alias
+                .as_deref()
+                .is_none_or(|owner| owner == alias)
+            {
+                let _ = add_predicate(&mut filter, "methods", &predicate);
+            }
+        }
+    }
+    if filter.is_empty() {
+        return None;
+    }
+    Some(
+        ds.files
+            .iter()
+            .map(|file| {
+                let mut candidates = filtered_methods(file, &filter);
+                candidates.sort_unstable();
+                candidates
+            })
+            .collect(),
+    )
 }
 
 pub(crate) fn try_fast_descriptor_lookup(

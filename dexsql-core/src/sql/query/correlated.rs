@@ -490,6 +490,24 @@ pub(super) fn in_subquery(
     source_dataset: Option<&Dataset>,
     caches: &NamedCaches,
 ) -> Result<Option<Expr>, String> {
+    let shadowed = query
+        .body
+        .as_select()
+        .map(|select| {
+            select
+                .from
+                .iter()
+                .flat_map(|source| {
+                    std::iter::once(&source.relation)
+                        .chain(source.joins.iter().map(|join| &join.relation))
+                })
+                .map(|factor| super::factor_alias(factor).to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default();
+    if !mentions_outer(query, outer_aliases, &shadowed)? {
+        return Ok(None);
+    }
     if one_projection(query).is_ok_and(has_aggregate) {
         if let Some(scalar) = scalar(query, outer_aliases, ds, source_dataset, caches)? {
             // Ungrouped aggregate subqueries have exactly one value per outer

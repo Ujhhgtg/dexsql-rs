@@ -944,6 +944,11 @@ const TABLE_CLASSES: &[ColumnMeta] = &[
 ];
 const TABLE_CLASS_INTERFACES: &[ColumnMeta] = &[
     ColumnMeta {
+        name: "class_descriptor",
+        sql_type: "Utf8",
+        nullable: false,
+    },
+    ColumnMeta {
         name: "file_id",
         sql_type: "UInt32",
         nullable: false,
@@ -1012,6 +1017,11 @@ const TABLE_CLASS_DATA_ITEMS: &[ColumnMeta] = &[
     },
 ];
 const TABLE_CLASS_FIELDS: &[ColumnMeta] = &[
+    ColumnMeta {
+        name: "field_type",
+        sql_type: "Utf8",
+        nullable: false,
+    },
     ColumnMeta {
         name: "file_id",
         sql_type: "UInt32",
