@@ -13,6 +13,7 @@ use dexsql_core::dex::metadata::CrossRefCache;
 pub use dexsql_core::dex::IndexNeeds;
 pub use dexsql_core::dex::MetaQuery;
 use dexsql_core::dex::{Dataset, LoadError};
+pub use dexsql_core::dex::{DexBytes, DexInput};
 use dexsql_core::sql::query::{execute_statement, NamedCaches};
 
 mod annotations;
@@ -108,6 +109,7 @@ impl fmt::Debug for Engine {
 
 impl Engine {
     /// Open one or more `.dex`, `.apk`, `.jar`, or `.zip` paths.
+    /// Path contents must stay unchanged while a session holds their mapped bytes.
     pub fn open<P>(paths: impl IntoIterator<Item = P>) -> Result<Self, Error>
     where
         P: Into<PathBuf>,
@@ -123,17 +125,33 @@ impl Engine {
     where
         P: Into<PathBuf>,
     {
-        let paths = paths.into_iter().map(Into::into).collect::<Vec<_>>();
-        if paths.is_empty() {
-            return Err(Error::Load("at least one input path is required".into()));
-        }
+        Self::open_inputs_with_options(
+            paths
+                .into_iter()
+                .map(|path| DexInput::Path(path.into()))
+                .collect(),
+            options,
+        )
+    }
+
+    /// Open an ordered mix of paths and immutable DEX images.
+    pub fn open_inputs(inputs: Vec<DexInput>) -> Result<Self, Error> {
+        Self::open_inputs_with_options(inputs, EngineOptions::default())
+    }
+
+    /// Open mixed inputs with explicit index and retention requirements.
+    pub fn open_inputs_with_options(
+        inputs: Vec<DexInput>,
+        options: EngineOptions,
+    ) -> Result<Self, Error> {
         dexsql_core::dex::configure_thread_pool(options.threads);
-        let dataset = Dataset::load_paths_with_requirements(
-            &paths,
+        let dataset = Dataset::load_inputs_with_retention(
+            inputs,
             options.index_needs,
             options.eager_code_items,
             options.full_code_items,
             options.retain_classes,
+            options.eager_code_items || options.full_code_items,
         )?;
         Ok(Self {
             dataset: Arc::new(dataset),

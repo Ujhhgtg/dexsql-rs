@@ -157,7 +157,6 @@ mod tests {
     use crate::dex::{Dataset, DexFile};
     use serde_json::json;
     use std::path::PathBuf;
-    use std::sync::Arc;
 
     fn fixture_file(name: &str) -> DexFile {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -213,7 +212,7 @@ mod tests {
         };
         assert!(encoded_annotation_json(&file, &mut cursor, 0).is_err());
 
-        file.bytes = Some(Arc::new(vec![0xff; 4]));
+        file.bytes = Some(crate::dex::DexBytes::from_vec(vec![0xff; 4]));
         assert!(annotation_set_json(&file, 0).is_err());
     }
 

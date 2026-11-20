@@ -7,10 +7,13 @@
 //! member.
 
 use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 
 use memmap2::Mmap;
 use rayon::prelude::*;
+
+use crate::dex::DexBytes;
 
 #[derive(Debug, Clone)]
 pub struct InflateError(pub String);
@@ -33,36 +36,70 @@ struct Entry {
 }
 
 /// Inflate all `classes*.dex` members from an archive in central-directory
-/// order. Stored entries are copied; deflated entries use miniz_oxide's raw
+/// order. Stored entries are copied for this API, and deflated entries use a raw
 /// DEFLATE decoder. The returned buffers own their bytes and can therefore be
 /// parsed after the mmap is dropped.
 pub fn inflate_dex_entries(path: &Path) -> Result<Vec<(String, Vec<u8>)>, InflateError> {
     inflate_dex_entries_with(path, None, |_, name, bytes| Ok((name, bytes)))
 }
 
-/// Return the number of `classes*.dex` members without inflating any bytes.
-pub fn dex_entry_count(path: &Path) -> Result<usize, InflateError> {
-    let file = File::open(path)
-        .map_err(|e| InflateError(format!("failed to open {}: {e}", path.display())))?;
-    let mmap = unsafe {
-        Mmap::map(&file)
-            .map_err(|e| InflateError(format!("failed to mmap {}: {e}", path.display())))?
-    };
-    Ok(find_dex_entries(&mmap)?.len())
+pub fn inflate_dex_entries_with<T, F>(
+    path: &Path,
+    target: Option<usize>,
+    parser: F,
+) -> Result<Vec<T>, InflateError>
+where
+    T: Send,
+    F: Fn(usize, String, Vec<u8>) -> Result<T, InflateError> + Sync,
+{
+    read_dex_entries_with(path, target, |index, name, bytes| {
+        parser(index, name, bytes.into_vec())
+    })
+}
+
+pub(crate) fn dex_layout(path: &Path) -> Result<Vec<usize>, InflateError> {
+    let file = File::open(path).map_err(|e| InflateError(e.to_string()))?;
+    let map = unsafe { Mmap::map(&file) }.map_err(|e| InflateError(e.to_string()))?;
+    let entries = find_dex_entries(&map)?;
+    let bytes = unsafe { DexBytes::from_mmap(map) };
+    entries
+        .iter()
+        .map(|entry| {
+            let compressed =
+                &bytes[entry.compressed_offset..entry.compressed_offset + entry.compressed_size];
+            let mut magic = [0; 8];
+            let container = match entry.method {
+                0 => compressed.starts_with(b"dex\n041\0"),
+                8 => {
+                    flate2::read::DeflateDecoder::new(compressed)
+                        .read_exact(&mut magic)
+                        .is_ok()
+                        && &magic == b"dex\n041\0"
+                }
+                _ => false,
+            };
+            if !container {
+                return Ok(1);
+            }
+            crate::dex::dex_headers(&inflate_entry(&bytes, entry)?)
+                .map(|headers| headers.len())
+                .map_err(|e| InflateError(e.to_string()))
+        })
+        .collect()
 }
 
 /// Inflate entries and parse each one on the same worker that produced its
 /// output.  This overlaps DEFLATE work with DEX parsing and matches the
 /// original pipeline's per-entry worker ownership.  `target_index` is used by
 /// decode to avoid inflating unrelated multidex members.
-pub fn inflate_dex_entries_with<T, F>(
+pub(crate) fn read_dex_entries_with<T, F>(
     path: &Path,
     target_index: Option<usize>,
     parser: F,
 ) -> Result<Vec<T>, InflateError>
 where
     T: Send,
-    F: Fn(usize, String, Vec<u8>) -> Result<T, InflateError> + Sync,
+    F: Fn(usize, String, DexBytes) -> Result<T, InflateError> + Sync,
 {
     let file = File::open(path)
         .map_err(|e| InflateError(format!("failed to open {}: {e}", path.display())))?;
@@ -71,41 +108,35 @@ where
             .map_err(|e| InflateError(format!("failed to mmap {}: {e}", path.display())))?
     };
     let entries = find_dex_entries(&mmap)?;
+    let bytes = unsafe { DexBytes::from_mmap(mmap) };
     entries
         .into_par_iter()
         .enumerate()
         .filter(|(index, _)| target_index.is_none_or(|target| target == *index))
         .map(|(index, entry)| {
             let name = entry.name.clone();
-            let bytes = inflate_entry(&mmap, &entry)?;
-            // Input bytes have been copied/decoded into the owned output.
-            // Retaining every compressed page until the final DEX finishes
-            // needlessly adds the archive's DEX compressed size to peak RSS.
+            let payload = inflate_entry(&bytes, &entry)?;
             #[cfg(unix)]
-            unsafe {
-                // Read-only file mapping: discarding pages changes neither
-                // their contents nor any other worker's owned output.
-                let _ = mmap.unchecked_advise_range(
-                    memmap2::UncheckedAdvice::DontNeed,
-                    entry.compressed_offset,
-                    entry.compressed_size,
+            if entry.method == 8 {
+                bytes.discard_mapped_pages(
+                    entry.compressed_offset..entry.compressed_offset + entry.compressed_size,
                 );
             }
-            parser(index, name, bytes)
+            parser(index, name, payload)
         })
         .collect()
 }
 
-fn inflate_entry(mmap: &[u8], entry: &Entry) -> Result<Vec<u8>, InflateError> {
+fn inflate_entry(mmap: &DexBytes, entry: &Entry) -> Result<DexBytes, InflateError> {
     let end = entry
         .compressed_offset
         .checked_add(entry.compressed_size)
         .ok_or_else(|| InflateError(format!("ZIP entry {} overflows", entry.name)))?;
     let input = mmap
-        .get(entry.compressed_offset..end)
+        .slice(entry.compressed_offset..end)
         .ok_or_else(|| InflateError(format!("ZIP entry {} exceeds archive bounds", entry.name)))?;
     let bytes = match entry.method {
-        0 => input.to_vec(),
+        0 => input,
         8 => {
             // The inflater writes every output byte before reading it as a
             // back-reference. Leave the exact-size buffer uninitialized so
@@ -118,7 +149,7 @@ fn inflate_entry(mmap: &[u8], entry: &Entry) -> Result<Vec<u8>, InflateError> {
             let mut decoder = flate2::Decompress::new(false);
             let status = decoder
                 .decompress_uninit(
-                    input,
+                    &input,
                     &mut output.spare_capacity_mut()[..entry.uncompressed_size],
                     flate2::FlushDecompress::Finish,
                 )
@@ -133,7 +164,7 @@ fn inflate_entry(mmap: &[u8], entry: &Entry) -> Result<Vec<u8>, InflateError> {
             }
             // The decoder confirmed that every byte in this range is initialized.
             unsafe { output.set_len(entry.uncompressed_size) };
-            output
+            DexBytes::from_vec(output)
         }
         method => {
             return Err(InflateError(format!(
@@ -251,4 +282,25 @@ fn u32_at(bytes: &[u8], off: usize) -> Result<u32, InflateError> {
         .get(off..off + 4)
         .ok_or_else(|| InflateError(format!("ZIP read u32 out of range at 0x{off:x}")))?;
     Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_entry_shares_the_archive_backing() {
+        let archive = DexBytes::from_vec(vec![0, 1, 2, 3]);
+        let entry = Entry {
+            name: "classes.dex".into(),
+            method: 0,
+            compressed_offset: 1,
+            compressed_size: 2,
+            uncompressed_size: 2,
+        };
+        let payload = inflate_entry(&archive, &entry).unwrap();
+        assert_eq!(payload.as_ptr(), archive[1..].as_ptr());
+        drop(archive);
+        assert_eq!(payload.as_ref(), &[1, 2]);
+    }
 }

@@ -10389,12 +10389,16 @@ fn scan_annotation_elements(
 
 fn annotation_owner_rows(
     file: &crate::dex::DexFile,
+    owner_filter: Option<&str>,
 ) -> Vec<(u32, &'static str, u32, Option<u32>, Option<String>, u32)> {
     let mut owners = Vec::new();
     // dexsql publishes class-owned annotations first, then field/method/
     // parameter owners in source class order. This ordering is observable in
     // SELECT * output and keeps shared annotation sets deterministic.
     for class_only in [true, false] {
+        if owner_filter.is_some_and(|kind| (kind == "class") != class_only) {
+            continue;
+        }
         for class in &file.classes {
             let dir = read_u32_at(
                 file.raw(),
@@ -10426,14 +10430,16 @@ fn annotation_owner_rows(
                         ));
                     }
                 };
-            push_set(
-                &mut owners,
-                "class",
-                class.class_idx,
-                None,
-                Some(file.type_descriptor(class.class_idx).to_owned()),
-                read_u32_at(file.raw(), dir as usize),
-            );
+            if class_only || owner_filter.is_none() {
+                push_set(
+                    &mut owners,
+                    "class",
+                    class.class_idx,
+                    None,
+                    Some(file.type_descriptor(class.class_idx).to_owned()),
+                    read_u32_at(file.raw(), dir as usize),
+                );
+            }
             if class_only {
                 continue;
             }
@@ -10441,31 +10447,42 @@ fn annotation_owner_rows(
             let methods = read_u32_at(file.raw(), dir as usize + 8) as usize;
             let params = read_u32_at(file.raw(), dir as usize + 12) as usize;
             let mut pos = dir as usize + 16;
-            for _ in 0..fields {
-                let idx = read_u32_at(file.raw(), pos);
-                let set = read_u32_at(file.raw(), pos + 4);
-                pos += 8;
-                push_set(
-                    &mut owners,
-                    "field",
-                    idx,
-                    None,
-                    Some(file.field_descriptor_ref(idx).to_owned()),
-                    set,
-                );
+            if owner_filter.is_some_and(|kind| kind != "field") {
+                pos += fields * 8;
+            } else {
+                for _ in 0..fields {
+                    let idx = read_u32_at(file.raw(), pos);
+                    let set = read_u32_at(file.raw(), pos + 4);
+                    pos += 8;
+                    push_set(
+                        &mut owners,
+                        "field",
+                        idx,
+                        None,
+                        (set != 0).then(|| file.field_descriptor_direct(idx)),
+                        set,
+                    );
+                }
             }
-            for _ in 0..methods {
-                let idx = read_u32_at(file.raw(), pos);
-                let set = read_u32_at(file.raw(), pos + 4);
-                pos += 8;
-                push_set(
-                    &mut owners,
-                    "method",
-                    idx,
-                    None,
-                    Some(file.method_descriptor_ref(idx).to_owned()),
-                    set,
-                );
+            if owner_filter.is_some_and(|kind| kind != "method") {
+                pos += methods * 8;
+            } else {
+                for _ in 0..methods {
+                    let idx = read_u32_at(file.raw(), pos);
+                    let set = read_u32_at(file.raw(), pos + 4);
+                    pos += 8;
+                    push_set(
+                        &mut owners,
+                        "method",
+                        idx,
+                        None,
+                        (set != 0).then(|| file.method_descriptor_direct(idx)),
+                        set,
+                    );
+                }
+            }
+            if owner_filter.is_some_and(|kind| kind != "parameter") {
+                continue;
             }
             for _ in 0..params {
                 let idx = read_u32_at(file.raw(), pos);
@@ -10506,7 +10523,7 @@ fn scan_annotation_values(
     let mut rows = Vec::new();
     for file in &ds.files {
         for (class_idx, owner_kind, owner_idx, parameter_idx, owner, annotation_off) in
-            annotation_owner_rows(file)
+            annotation_owner_rows(file, None)
         {
             let (_, type_idx, elements, _) =
                 read_annotation_instance(file.raw(), annotation_off as usize);
@@ -10668,7 +10685,7 @@ fn scan_annotation_elements_resolved(
     let mut rows = Vec::new();
     for file in &ds.files {
         for (class_idx, owner_kind, owner_idx, parameter_idx, owner, annotation_off) in
-            annotation_owner_rows(file)
+            annotation_owner_rows(file, None)
         {
             let (visibility, type_idx, elements, _) =
                 read_annotation_instance(file.raw(), annotation_off as usize);

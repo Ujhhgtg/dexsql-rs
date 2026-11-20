@@ -3559,6 +3559,9 @@ pub(crate) fn try_fast_descriptor_lookup(
         return None;
     }
     let (base_alias, base_table) = table_factor(&select.from[0].relation)?;
+    if base_table == "annotation_elements_resolved" {
+        return annotation_owner_lookup(query, select, ds, &base_alias, cli_limit).map(Ok);
+    }
     let mut factors = vec![Factor {
         alias: base_alias.clone(),
         table: base_table.clone(),
@@ -3651,9 +3654,196 @@ pub(crate) fn try_fast_descriptor_lookup(
     result.ok().map(Ok)
 }
 
+fn annotation_owner_lookup(
+    query: &sqlparser::ast::Query,
+    select: &Select,
+    dataset: &Dataset,
+    alias: &str,
+    cli_limit: Option<u64>,
+) -> Option<QueryResult> {
+    let (column, label) = projected_column(select, alias)?;
+    if !matches!(select.distinct, Some(sqlparser::ast::Distinct::Distinct))
+        || column.1 != "owner"
+        || !order_column_is(query, &column)
+    {
+        return None;
+    }
+    let (predicates, distinct_pairs) = parse_predicates(select)?;
+    if !distinct_pairs.is_empty() {
+        return None;
+    }
+    let joins = &select.from[0].joins;
+    let mut strings_alias = None;
+    if let [dex_join, string_join] = joins.as_slice() {
+        let (dex_alias, dex_table) = table_factor(&dex_join.relation)?;
+        let (string_alias, string_table) = table_factor(&string_join.relation)?;
+        if dex_table != "dex_files"
+            || string_table != "strings"
+            || dex_alias == alias
+            || string_alias == alias
+            || string_alias == dex_alias
+        {
+            return None;
+        }
+        let expected = |left_alias: &str, left: &str, right_alias: &str, right: &str| {
+            (
+                (Some(left_alias.into()), left.into()),
+                (Some(right_alias.into()), right.into()),
+            )
+        };
+        if join_on_columns(&dex_join.join_operator)?
+            != expected(&dex_alias, "file_id", alias, "file_id")
+        {
+            return None;
+        }
+        let condition = match &string_join.join_operator {
+            JoinOperator::Join(JoinConstraint::On(condition))
+            | JoinOperator::Inner(JoinConstraint::On(condition)) => condition,
+            _ => return None,
+        };
+        let mut terms = Vec::new();
+        flatten_and(condition, &mut terms);
+        let [pool, index] = terms.as_slice() else {
+            return None;
+        };
+        let equality = |term: &Expr| {
+            let Expr::BinaryOp {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+                ..
+            } = term
+            else {
+                return None;
+            };
+            Some((column_expr(left)?, column_expr(right)?))
+        };
+        if equality(pool)?
+            != expected(
+                &string_alias,
+                "string_pool_id",
+                &dex_alias,
+                "string_pool_id",
+            )
+            || equality(index)? != expected(&string_alias, "string_idx", alias, "value_index")
+        {
+            return None;
+        }
+        strings_alias = Some(string_alias);
+    } else if !joins.is_empty() {
+        return None;
+    }
+    let mut kind = None;
+    let mut annotation = None;
+    let mut visibility = None;
+    let mut element_name = None;
+    let mut string_kind = false;
+    let mut string = None;
+    for predicate in &predicates {
+        let qualifier = predicate.alias.as_deref();
+        if qualifier == Some(alias) && !matches!(predicate.kind, PredKind::Eq) {
+            return None;
+        }
+        match (qualifier == Some(alias), predicate.column.as_str()) {
+            (true, "owner_kind") if kind.is_none() => kind = Some(predicate.text()?),
+            (true, "annotation") if annotation.is_none() => annotation = Some(predicate.text()?),
+            (true, "visibility") if visibility.is_none() => visibility = Some(predicate.int()?),
+            (true, "element_name") if element_name.is_none() => {
+                element_name = Some(predicate.text()?)
+            }
+            (true, "value_kind") if !string_kind && predicate.text()? == "string" => {
+                string_kind = true
+            }
+            (false, "value")
+                if strings_alias.is_some()
+                    && qualifier == strings_alias.as_deref()
+                    && string.is_none() =>
+            {
+                let mode = match predicate.kind {
+                    PredKind::Eq => LikeMode::Equal,
+                    PredKind::Contains => LikeMode::Contains,
+                    PredKind::Prefix => LikeMode::Prefix,
+                    PredKind::Suffix => LikeMode::Suffix,
+                    _ => return None,
+                };
+                string = Some((predicate.text()?, mode));
+            }
+            _ => return None,
+        }
+    }
+    let kind = kind?;
+    if !matches!(kind, "class" | "field" | "method")
+        || strings_alias.is_some() != string.is_some()
+        || string_kind != string.is_some()
+        || (element_name.is_some() && string.is_none())
+    {
+        return None;
+    }
+    let limit = query_limit(query)?;
+    let mut owners = Vec::new();
+    for file in &dataset.files {
+        let string_index = match string {
+            Some((value, LikeMode::Equal)) => match file.find_string_idx(value) {
+                Some(index) => Some(index),
+                None => continue,
+            },
+            _ => None,
+        };
+        for (_, _, _, _, owner, offset) in super::annotation_owner_rows(file, Some(kind)) {
+            let (actual_visibility, type_idx, elements, _) =
+                super::read_annotation_instance(file.raw(), offset as usize);
+            if visibility.is_some_and(|want| want != i64::from(actual_visibility))
+                || annotation.is_some_and(|want| want != file.type_descriptor(type_idx))
+            {
+                continue;
+            }
+            if let Some((expected, mode)) = string {
+                if !elements.iter().any(|(name, value)| {
+                    element_name.is_none_or(|wanted| wanted == file.string(*name))
+                        && value.kind == "string"
+                        && value.index.is_some_and(|index| match mode {
+                            LikeMode::Equal => Some(index) == string_index,
+                            LikeMode::Contains => file.string(index).contains(expected),
+                            LikeMode::Prefix => file.string(index).starts_with(expected),
+                            LikeMode::Suffix => file.string(index).ends_with(expected),
+                        })
+                }) {
+                    continue;
+                }
+            }
+            if let Some(owner) = owner {
+                owners.push(owner);
+            }
+        }
+    }
+    Some(apply_limit(owners, label, limit, cli_limit))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn annotation_owner_lookup_finds_annotations_without_materializing_relations() {
+        let fixture =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/dex/annotated.dex");
+        let dataset = Dataset::load_paths(&[fixture]).unwrap();
+        let sql = "SELECT DISTINCT ar.owner AS descriptor FROM annotation_elements_resolved ar \
+                   WHERE ar.owner_kind = 'method' AND ar.annotation = 'Lfixtures/Meta;' \
+                   ORDER BY ar.owner";
+        let result = try_fast_descriptor_lookup(&parse(sql), &dataset, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result.rows,
+            [["Lfixtures/Annotated;->genericList(Ljava/util/List;)Ljava/util/List;"]]
+        );
+        let wrong_kind = sql.replace("'method'", "'field'");
+        let result = try_fast_descriptor_lookup(&parse(&wrong_kind), &dataset, None)
+            .unwrap()
+            .unwrap();
+        assert!(result.rows.is_empty());
+    }
 
     #[test]
     fn parses_plain_like_forms() {

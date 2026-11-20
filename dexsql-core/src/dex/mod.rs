@@ -16,16 +16,29 @@ use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
 
 pub mod annotations;
+mod bytes;
 pub mod decode;
 pub mod metadata;
 mod string_pool;
 
+pub use bytes::DexBytes;
 pub use metadata::MetaQuery;
 use metadata::MetadataIndexes;
 pub use string_pool::StringPool;
 
 #[derive(Debug, Clone)]
 pub struct LoadError(pub String);
+
+/// An archive/file path or one complete DEX image (including a v41 container).
+#[derive(Debug, Clone)]
+pub enum DexInput {
+    Path(PathBuf),
+    Memory {
+        source_name: String,
+        entry_name: String,
+        bytes: DexBytes,
+    },
+}
 
 impl std::fmt::Display for LoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -234,7 +247,7 @@ pub struct DexFile {
     /// Raw DEX payload. Dropped after parsing when no lazy consumer
     /// (code items, debug info, decode views) can touch it, mirroring the
     /// reference's mmap-backed lifetime.
-    pub bytes: Option<Arc<Vec<u8>>>,
+    pub bytes: Option<DexBytes>,
     /// Original payload length; kept after the payload is dropped because
     /// the dex_files relation exposes it.
     pub byte_len: u64,
@@ -242,6 +255,7 @@ pub struct DexFile {
     pub checksum: u32,
     pub signature_hex: String,
     pub header_size: u32,
+    pub header_offset: usize,
     pub endian_tag: u32,
     pub map_off: u32,
     pub string_ids_off: u32,
@@ -366,7 +380,7 @@ impl DexFile {
     }
     /// Raw DEX bytes; empty after a parse-only load dropped the payload.
     pub fn raw(&self) -> &[u8] {
-        self.bytes.as_deref().map(|b| b.as_slice()).unwrap_or(&[])
+        self.bytes.as_deref().unwrap_or(&[])
     }
 
     /// Drop the raw DEX payload. Only valid when no lazy byte consumer
@@ -1648,15 +1662,18 @@ impl Dataset {
                 _ => return Ok(None),
             }
         }
-        if table == "dex_files" {
-            return Ok(Some(dex_bytes.len() as u64));
-        }
         let mut total = 0u64;
         for bytes in &dex_bytes {
-            let Some(value) = fast_dex_header_count(bytes, table) else {
-                return Ok(None);
-            };
-            total = total.saturating_add(value as u64);
+            for (header_offset, _) in dex_headers(bytes)? {
+                if table == "dex_files" {
+                    total += 1;
+                    continue;
+                }
+                let Some(value) = fast_dex_header_count(bytes, header_offset, table) else {
+                    return Ok(None);
+                };
+                total = total.saturating_add(value as u64);
+            }
         }
         Ok(Some(total))
     }
@@ -1776,12 +1793,75 @@ impl Dataset {
         retain_raw_bytes: bool,
         target_file_id: Option<u32>,
     ) -> Result<Self, LoadError> {
-        if paths.is_empty() {
+        Self::load_inputs(
+            paths.iter().cloned().map(DexInput::Path).collect(),
+            index_needs,
+            eager_code_items,
+            full_code_items,
+            retain_classes,
+            retain_raw_bytes,
+            target_file_id,
+        )
+    }
+
+    pub fn load_inputs_with_retention(
+        inputs: Vec<DexInput>,
+        index_needs: IndexNeeds,
+        eager_code_items: bool,
+        full_code_items: bool,
+        retain_classes: bool,
+        retain_raw_bytes: bool,
+    ) -> Result<Self, LoadError> {
+        Self::load_inputs(
+            inputs,
+            index_needs,
+            eager_code_items,
+            full_code_items,
+            retain_classes,
+            retain_raw_bytes,
+            None,
+        )
+    }
+
+    fn load_inputs(
+        inputs: Vec<DexInput>,
+        index_needs: IndexNeeds,
+        eager_code_items: bool,
+        full_code_items: bool,
+        retain_classes: bool,
+        retain_raw_bytes: bool,
+        target_file_id: Option<u32>,
+    ) -> Result<Self, LoadError> {
+        if inputs.is_empty() {
             return Err(LoadError("at least one DEX/APK input is required".into()));
         }
         let mut files = Vec::new();
         let mut logical_file_base = 0u32;
-        for path in paths {
+        for input in inputs {
+            let path = match input {
+                DexInput::Path(path) => path,
+                DexInput::Memory {
+                    source_name,
+                    entry_name,
+                    bytes,
+                } => {
+                    let loaded = parse_image(
+                        bytes,
+                        PathBuf::from(source_name),
+                        entry_name,
+                        logical_file_base,
+                        target_file_id,
+                        index_needs,
+                        eager_code_items,
+                        full_code_items,
+                        retain_classes,
+                        retain_raw_bytes,
+                    )?;
+                    logical_file_base = loaded.0;
+                    files.extend(loaded.1);
+                    continue;
+                }
+            };
             let ext = path
                 .extension()
                 .and_then(|v| v.to_str())
@@ -1789,39 +1869,34 @@ impl Dataset {
                 .to_ascii_lowercase();
             match ext.as_str() {
                 "dex" => {
-                    let file_id = logical_file_base;
-                    logical_file_base = logical_file_base.saturating_add(1);
-                    if target_file_id.is_some_and(|target| target != file_id) {
-                        continue;
-                    }
-                    let bytes = std::fs::read(path).map_err(|e| {
+                    let file = File::open(&path).map_err(|e| {
                         LoadError(format!("failed to read {}: {e}", path.display()))
                     })?;
-                    let mut file = parse_dex(
-                        bytes,
-                        file_id,
-                        path.clone(),
-                        path.file_name()
-                            .and_then(|v| v.to_str())
-                            .unwrap_or("classes.dex")
-                            .into(),
+                    let mapping = unsafe { MmapOptions::new().map(&file) }
+                        .map_err(|e| LoadError(format!("failed to map {}: {e}", path.display())))?;
+                    let entry = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("classes.dex")
+                        .to_owned();
+                    let loaded = parse_image(
+                        unsafe { DexBytes::from_mmap(mapping) },
+                        path,
+                        entry,
+                        logical_file_base,
+                        target_file_id,
                         index_needs,
                         eager_code_items,
                         full_code_items,
                         retain_classes,
+                        retain_raw_bytes,
                     )?;
-                    // Index-only loads have no lazy consumer after parse.
-                    // Release each DEX payload before the next input is
-                    // inflated instead of retaining every archive member
-                    // until Dataset construction finishes.
-                    if !retain_raw_bytes {
-                        file.drop_raw_bytes();
-                    }
-                    files.push(file);
+                    logical_file_base = loaded.0;
+                    files.extend(loaded.1);
                 }
                 "apk" | "jar" | "zip" => {
                     logical_file_base = load_archive(
-                        path,
+                        &path,
                         &mut files,
                         index_needs,
                         eager_code_items,
@@ -2165,6 +2240,7 @@ impl Dataset {
             checksum: 0,
             signature_hex: String::new(),
             header_size: 0,
+            header_offset: 0,
             endian_tag: 0,
             map_off: 0,
             string_ids_off: 0,
@@ -2341,6 +2417,7 @@ impl Dataset {
             checksum: 0,
             signature_hex: String::new(),
             header_size: 0,
+            header_offset: 0,
             endian_tag: 0,
             map_off: 0,
             string_ids_off: 0,
@@ -2706,11 +2783,11 @@ fn native_dex_files_section(dataset: &Dataset) -> Result<Vec<u8>, LoadError> {
         // then count/offset pairs for strings, types, protos, fields,
         // methods, classes, followed by data_size/data_off.
         let mut fields = [0u32; 20];
-        fields[0] = read_u32(file.raw(), 32).unwrap_or(file.raw().len() as u32);
+        fields[0] = read_u32(file.raw(), file.header_offset + 32).unwrap_or(file.byte_len as u32);
         fields[1] = file.header_size;
         fields[2] = file.endian_tag;
-        fields[3] = read_u32(file.raw(), 44).unwrap_or(0);
-        fields[4] = read_u32(file.raw(), 48).unwrap_or(0);
+        fields[3] = read_u32(file.raw(), file.header_offset + 44).unwrap_or(0);
+        fields[4] = read_u32(file.raw(), file.header_offset + 48).unwrap_or(0);
         fields[5] = file.map_off;
         fields[6] = file.strings.len() as u32;
         fields[7] = file.string_ids_off;
@@ -4302,51 +4379,50 @@ fn load_archive(
     target_file_id: Option<u32>,
 ) -> Result<u32, LoadError> {
     let base = logical_file_base;
-    // The inflater discovers the member count before dispatching workers. A
-    // target file id can therefore be selected without inflating unrelated
-    // multidex entries while the normal query path keeps parsing overlapped
-    // with DEFLATE.
-    let dex_count = crate::archive::dex_entry_count(path)
-        .map_err(|e| LoadError(format!("invalid ZIP/APK {}: {e}", path.display())))?
-        as u32;
+    let mut selected = None;
+    let mut selected_base = base;
+    let mut end = base;
     if let Some(target) = target_file_id {
-        if target < base || target >= base + dex_count {
-            return Ok(base + dex_count);
+        let layout = crate::archive::dex_layout(path)
+            .map_err(|e| LoadError(format!("invalid ZIP/APK {}: {e}", path.display())))?;
+        for (index, count) in layout.into_iter().enumerate() {
+            let next = end + count as u32;
+            if target >= end && target < next {
+                selected = Some(index);
+                selected_base = end;
+            }
+            end = next;
+        }
+        if selected.is_none() {
+            return Ok(end);
         }
     }
-    let parsed = crate::archive::inflate_dex_entries_with(
-        path,
-        target_file_id.map(|target| target.saturating_sub(base) as usize),
-        |index, name, bytes| {
-            let parsed = parse_dex(
-                bytes,
-                base + index as u32,
-                path.to_path_buf(),
-                name,
-                index_needs,
-                eager_code_items,
-                full_code_items,
-                retain_classes,
-            )
-            .map(|mut file| {
-                if !retain_raw_bytes {
-                    file.drop_raw_bytes();
-                }
-                file
-            });
-            Ok(parsed)
-        },
-    )
+    let parsed = crate::archive::read_dex_entries_with(path, selected, |_, name, bytes| {
+        Ok(parse_image(
+            bytes,
+            path.to_path_buf(),
+            name,
+            selected_base,
+            target_file_id,
+            index_needs,
+            eager_code_items,
+            full_code_items,
+            retain_classes,
+            retain_raw_bytes,
+        ))
+    })
     .map_err(|e| LoadError(format!("invalid ZIP/APK {}: {e}", path.display())))?;
     let mut loaded = Vec::with_capacity(parsed.len());
     let mut first_error = None;
     for result in parsed {
         match result {
-            Ok(mut file) => {
-                if target_file_id.is_none() {
-                    file.file_id = base + loaded.len() as u32;
+            Ok((_, members)) => {
+                for mut file in members {
+                    if target_file_id.is_none() {
+                        file.file_id = base + loaded.len() as u32;
+                    }
+                    loaded.push(file);
                 }
-                loaded.push(file);
             }
             Err(error) => {
                 first_error.get_or_insert(error);
@@ -4361,14 +4437,99 @@ fn load_archive(
     let next = if target_file_id.is_none() {
         base + loaded.len() as u32
     } else {
-        base + dex_count
+        end
     };
     files.extend(loaded);
     Ok(next)
 }
 
+pub(crate) fn dex_headers(bytes: &[u8]) -> Result<Vec<(usize, usize)>, LoadError> {
+    if !bytes.starts_with(b"dex\n041\0") {
+        return Ok(vec![(0, bytes.len())]);
+    }
+    let mut headers = Vec::new();
+    let size = read_u32(bytes, 112)? as usize;
+    if size != bytes.len() {
+        return Err(LoadError(
+            "DEX v41 container size differs from input length".into(),
+        ));
+    }
+    let mut offset = 0;
+    while offset < size {
+        let header = bytes
+            .get(offset..)
+            .and_then(|remaining| remaining.get(..120))
+            .ok_or_else(|| LoadError("truncated DEX v41 header".into()))?;
+        let length = read_u32(header, 32)? as usize;
+        if !header.starts_with(b"dex\n041\0")
+            || read_u32(header, 36)? != 120
+            || read_u32(header, 112)? as usize != size
+            || read_u32(header, 116)? as usize != offset
+            || length < 120
+            || length > size - offset
+            || (length < size - offset && length % 4 != 0)
+        {
+            return Err(LoadError(format!(
+                "invalid DEX v41 header at offset {offset}"
+            )));
+        }
+        headers.push((offset, length));
+        offset += length;
+    }
+    Ok(headers)
+}
+
+fn parse_image(
+    bytes: DexBytes,
+    source_path: PathBuf,
+    entry_name: String,
+    base: u32,
+    target: Option<u32>,
+    needs: IndexNeeds,
+    eager_code_items: bool,
+    full_code_items: bool,
+    retain_classes: bool,
+    retain_raw_bytes: bool,
+) -> Result<(u32, Vec<DexFile>), LoadError> {
+    let headers = dex_headers(&bytes)?;
+    let end = base
+        .checked_add(headers.len() as u32)
+        .ok_or_else(|| LoadError("too many logical DEX files".into()))?;
+    let mut files = Vec::new();
+    for (index, (header_offset, length)) in headers.into_iter().enumerate() {
+        let file_id = base + index as u32;
+        if target.is_some_and(|target| target != file_id) {
+            continue;
+        }
+        let name = if header_offset == 0 {
+            entry_name.clone()
+        } else {
+            format!("{entry_name}@{header_offset}")
+        };
+        let mut file = parse_dex(
+            bytes.clone(),
+            header_offset,
+            length,
+            file_id,
+            source_path.clone(),
+            name,
+            needs,
+            eager_code_items,
+            full_code_items,
+            retain_classes,
+        )?;
+        if !retain_raw_bytes {
+            file.drop_raw_bytes();
+        }
+        files.push(file);
+    }
+    Ok((end, files))
+}
+
 fn parse_dex(
-    bytes: Vec<u8>,
+    bytes: DexBytes,
+    header_offset: usize,
+    byte_len: usize,
     file_id: u32,
     source_path: PathBuf,
     entry_name: String,
@@ -4377,33 +4538,35 @@ fn parse_dex(
     full_code_items: bool,
     retain_classes: bool,
 ) -> Result<DexFile, LoadError> {
-    if bytes.len() < 112 || &bytes[0..4] != b"dex\n" || bytes[7] != 0 {
+    let header = &bytes[header_offset..];
+    if header.len() < 112 || &header[0..4] != b"dex\n" || header[7] != 0 {
         return Err(LoadError(format!("{} is not a DEX file", entry_name)));
     }
-    let version = String::from_utf8_lossy(&bytes[4..7]).to_string();
+    let version = String::from_utf8_lossy(&header[4..7]).to_string();
     let read32 = |off| read_u32(&bytes, off);
-    let checksum = read32(8)?;
-    let signature_hex = bytes[12..32]
+    let header32 = |off| read_u32(header, off);
+    let checksum = header32(8)?;
+    let signature_hex = header[12..32]
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
-    let header_size = read32(36)?;
-    let endian_tag = read32(40)?;
-    let map_off = read32(52)?;
-    let string_count = read32(56)?;
-    let string_ids_off = read32(60)?;
-    let type_count = read32(64)?;
-    let type_ids_off = read32(68)?;
-    let proto_count = read32(72)?;
-    let proto_ids_off = read32(76)?;
-    let field_count = read32(80)?;
-    let field_ids_off = read32(84)?;
-    let method_count = read32(88)?;
-    let method_ids_off = read32(92)?;
-    let class_count = read32(96)?;
-    let class_defs_off = read32(100)?;
-    let data_size = read32(104)?;
-    let data_off = read32(108)?;
+    let header_size = header32(36)?;
+    let endian_tag = header32(40)?;
+    let map_off = header32(52)?;
+    let string_count = header32(56)?;
+    let string_ids_off = header32(60)?;
+    let type_count = header32(64)?;
+    let type_ids_off = header32(68)?;
+    let proto_count = header32(72)?;
+    let proto_ids_off = header32(76)?;
+    let field_count = header32(80)?;
+    let field_ids_off = header32(84)?;
+    let method_count = header32(88)?;
+    let method_ids_off = header32(92)?;
+    let class_count = header32(96)?;
+    let class_defs_off = header32(100)?;
+    let data_size = header32(104)?;
+    let data_off = header32(108)?;
     for (off, count, width, label) in [
         (string_ids_off, string_count, 4, "string_ids"),
         (type_ids_off, type_count, 4, "type_ids"),
@@ -4547,7 +4710,7 @@ fn parse_dex(
         Vec::new()
     };
     let mut code_offsets = Vec::new();
-    let raw_bytes = Arc::new(bytes);
+    let raw_bytes = bytes;
     let bytes = raw_bytes.clone();
     for class_def_idx in 0..class_count {
         let off = class_defs_off as usize + class_def_idx as usize * 32;
@@ -4621,6 +4784,7 @@ fn parse_dex(
         checksum,
         signature_hex,
         header_size,
+        header_offset,
         endian_tag,
         map_off,
         string_ids_off,
@@ -4647,8 +4811,8 @@ fn parse_dex(
         field_descriptors: Arc::new(OnceLock::new()),
         debug_rows_cache: Arc::new(OnceLock::new()),
         method_code_offsets: Arc::new(OnceLock::new()),
-        bytes: Some(raw_bytes.clone()),
-        byte_len: raw_bytes.len() as u64,
+        bytes: Some(raw_bytes),
+        byte_len: byte_len as u64,
         method_descriptor_order: Arc::new(OnceLock::new()),
         string_utf16_ranks: Arc::new(OnceLock::new()),
         strings_utf16_sorted: Arc::new(OnceLock::new()),
@@ -5645,32 +5809,34 @@ fn fast_annotation_set_count(
     Some(offsets.len())
 }
 
-fn fast_dex_header_count(bytes: &[u8], table: &str) -> Option<usize> {
-    if bytes.len() < 112 || &bytes[0..4] != b"dex\n" {
+fn fast_dex_header_count(bytes: &[u8], header_offset: usize, table: &str) -> Option<usize> {
+    let header = bytes.get(header_offset..)?;
+    if header.len() < 112 || &header[0..4] != b"dex\n" {
         return None;
     }
     let read = |off: usize| -> Option<u32> {
         let v = bytes.get(off..off + 4)?;
         Some(u32::from_le_bytes([v[0], v[1], v[2], v[3]]))
     };
+    let read_header = |off| read(header_offset + off);
     if table == "annotation_sets" {
-        let class_count = read(96)? as usize;
-        let class_defs_off = read(100)? as usize;
+        let class_count = read_header(96)? as usize;
+        let class_defs_off = read_header(100)? as usize;
         return fast_annotation_set_count(bytes, class_defs_off, class_count);
     }
     let direct = match table {
-        "strings" => read(56),
-        "type_ids" | "types" => read(64),
-        "proto_ids" | "protos" => read(72),
-        "field_ids" | "fields" => read(80),
-        "method_ids" | "methods" | "method_opcodes" => read(88),
-        "class_defs" | "classes" => read(96),
+        "strings" => read_header(56),
+        "type_ids" | "types" => read_header(64),
+        "proto_ids" | "protos" => read_header(72),
+        "field_ids" | "fields" => read_header(80),
+        "method_ids" | "methods" | "method_opcodes" => read_header(88),
+        "class_defs" | "classes" => read_header(96),
         _ => None,
     };
     if let Some(value) = direct {
         return Some(value as usize);
     }
-    let map_off = read(52)? as usize;
+    let map_off = read_header(52)? as usize;
     let map_size = read(map_off)? as usize;
     let mut map_items = 0usize;
     let mut ids = 0usize;
