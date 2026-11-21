@@ -8441,6 +8441,32 @@ fn scan_class_interfaces(
     Ok(rows)
 }
 
+fn for_each_code_item(
+    file: &crate::dex::DexFile,
+    mut visit: impl FnMut(usize, &crate::dex::CodeItem),
+) -> Result<(), String> {
+    if !file.code_items.is_empty() {
+        for (idx, code) in file.code_items.iter().enumerate() {
+            if let Some(code) = code {
+                visit(idx, code);
+            }
+        }
+        return Ok(());
+    }
+    if file.raw().is_empty() {
+        return Ok(());
+    }
+    for method_idx in 0..file.methods.len() as u32 {
+        if let Some(code) = file
+            .decode_code_item(method_idx)
+            .map_err(|e| e.to_string())?
+        {
+            visit(method_idx as usize, &code);
+        }
+    }
+    Ok(())
+}
+
 fn scan_code_items(
     ds: &Dataset,
     alias: &str,
@@ -8448,8 +8474,7 @@ fn scan_code_items(
 ) -> Result<Vec<RelRow>, String> {
     let mut rows = Vec::new();
     for file in &ds.files {
-        for (idx, code) in file.code_items.iter().enumerate() {
-            let Some(code) = code else { continue };
+        for_each_code_item(file, |idx, code| {
             let tries_off = if code.tries_size > 0 {
                 ((code.code_off as usize + 16 + code.insns.len() * 2 + 3) & !3) as i64
             } else {
@@ -8498,7 +8523,7 @@ fn scan_code_items(
                 },
             );
             rows.push(row);
-        }
+        })?;
     }
     Ok(rows)
 }
@@ -8510,12 +8535,7 @@ fn scan_try_items(
 ) -> Result<Vec<RelRow>, String> {
     let mut rows = Vec::new();
     for file in &ds.files {
-        for (method_idx, code) in file
-            .code_items
-            .iter()
-            .enumerate()
-            .filter_map(|(i, c)| c.as_ref().map(|c| (i, c)))
-        {
+        for_each_code_item(file, |method_idx, code| {
             for (try_idx, item) in code.tries.iter().enumerate() {
                 let mut row = RelRow::with_capacity(6);
                 row.put(alias, "file_id", Scalar::Int(file.file_id as i64));
@@ -8526,7 +8546,7 @@ fn scan_try_items(
                 row.put(alias, "handler_off", Scalar::Int(item.handler_off as i64));
                 rows.push(row);
             }
-        }
+        })?;
     }
     Ok(rows)
 }
@@ -8538,12 +8558,7 @@ fn scan_catch_handlers(
 ) -> Result<Vec<RelRow>, String> {
     let mut rows = Vec::new();
     for file in &ds.files {
-        for (method_idx, code) in file
-            .code_items
-            .iter()
-            .enumerate()
-            .filter_map(|(i, c)| c.as_ref().map(|c| (i, c)))
-        {
+        for_each_code_item(file, |method_idx, code| {
             for (handler_idx, set) in code.catch_handlers.iter().enumerate() {
                 for (ordinal, handler) in set.handlers.iter().enumerate() {
                     let mut row = RelRow::with_capacity(8);
@@ -8569,7 +8584,7 @@ fn scan_catch_handlers(
                     rows.push(row);
                 }
             }
-        }
+        })?;
     }
     Ok(rows)
 }

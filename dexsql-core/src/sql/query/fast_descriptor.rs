@@ -940,138 +940,6 @@ fn bitwise_flags_predicate(left: &Expr, right: &Expr) -> Option<(String, i64, i6
     Some((alias?, mask, expected))
 }
 
-fn param_descriptors(file: &DexFile, proto: &crate::dex::ProtoInfo) -> String {
-    let mut descriptor = String::new();
-    for (index, param) in proto.parameters.iter().enumerate() {
-        if index > 0 {
-            descriptor.push(',');
-        }
-        descriptor.push_str(file.type_descriptor(*param as u32));
-    }
-    descriptor
-}
-
-fn method_matches(file: &DexFile, method_idx: u32, filter: &MethodFilter) -> bool {
-    if filter.is_empty() {
-        return true;
-    }
-    let Some(method) = file.methods.get(method_idx as usize) else {
-        return false;
-    };
-    let class = file.type_descriptor(method.class_idx as u32);
-    if !filter.classes.is_empty() && !filter.classes.iter().any(|value| value == class) {
-        return false;
-    }
-    if !filter.class_likes.is_empty()
-        && !filter
-            .class_likes
-            .iter()
-            .any(|need| plain_like_match(class, need))
-    {
-        return false;
-    }
-    if !filter.excluded_class_likes.is_empty()
-        && filter
-            .excluded_class_likes
-            .iter()
-            .any(|need| plain_like_match(class, need))
-    {
-        return false;
-    }
-    let name = file.string(method.name_idx);
-    if !filter.names.is_empty() && !filter.names.iter().any(|value| value == name) {
-        return false;
-    }
-    let Some(proto) = file.protos.get(method.proto_idx as usize) else {
-        return false;
-    };
-    if !filter.returns.is_empty() {
-        let returns = file.type_descriptor(proto.return_type_idx);
-        if !filter
-            .returns
-            .iter()
-            .any(|need| plain_like_match(returns, need))
-        {
-            return false;
-        }
-    }
-    let param_count = proto.parameters.len() as i64;
-    if !filter.param_counts.is_empty() && !filter.param_counts.contains(&param_count) {
-        return false;
-    }
-    if filter
-        .param_count_min
-        .iter()
-        .any(|minimum| param_count < *minimum)
-    {
-        return false;
-    }
-    if filter
-        .param_count_max
-        .iter()
-        .any(|maximum| param_count > *maximum)
-    {
-        return false;
-    }
-    if !filter.param_patterns.is_empty()
-        && !filter.param_patterns.iter().all(|pattern| {
-            pattern.matches_params(proto.parameters.len(), |index| {
-                file.type_descriptor(proto.parameters[index] as u32)
-            })
-        })
-    {
-        return false;
-    }
-    if !filter.param_pattern_any.is_empty()
-        && !filter.param_pattern_any.iter().any(|pattern| {
-            pattern.matches_params(proto.parameters.len(), |index| {
-                file.type_descriptor(proto.parameters[index] as u32)
-            })
-        })
-    {
-        return false;
-    }
-    if !filter.param_descriptors.is_empty() {
-        let descriptor = param_descriptors(file, proto);
-        if !filter
-            .param_descriptors
-            .iter()
-            .any(|value| value == &descriptor)
-        {
-            return false;
-        }
-    }
-    if !filter.flags.is_empty() {
-        let Some(flags) = file.method_access_flags(method_idx) else {
-            return false;
-        };
-        let flags = flags as i64;
-        if !filter
-            .flags
-            .iter()
-            .all(|(mask, expected)| flags & mask == *expected)
-        {
-            return false;
-        }
-    }
-    if filter.opcode_count_min.is_some() || filter.opcode_count_max.is_some() {
-        let Some(count) = file.method_opcode_count(method_idx) else {
-            return false;
-        };
-        let count = count as i64;
-        if filter
-            .opcode_count_min
-            .is_some_and(|minimum| count < minimum)
-            || filter
-                .opcode_count_max
-                .is_some_and(|maximum| count > maximum)
-        {
-            return false;
-        }
-    }
-    true
-}
-
 fn string_candidate_methods(file: &DexFile, need: &StringNeed) -> HashSet<u32> {
     let mut out = HashSet::new();
     if need.mode == LikeMode::Equal && !need.case_insensitive {
@@ -1104,6 +972,8 @@ fn string_candidate_methods(file: &DexFile, need: &StringNeed) -> HashSet<u32> {
 }
 
 fn candidate_methods(file: &DexFile, filter: &MethodFilter) -> Option<HashSet<u32>> {
+    const BROAD_INDEX_SKIP_THRESHOLD: usize = 256;
+
     if filter.descriptors.windows(2).any(|pair| pair[0] != pair[1]) {
         return Some(HashSet::new());
     }
@@ -1130,32 +1000,105 @@ fn candidate_methods(file: &DexFile, filter: &MethodFilter) -> Option<HashSet<u3
                 .collect(),
         )
     };
+    if candidate.as_ref().is_some_and(HashSet::is_empty) {
+        return candidate;
+    }
+
+    // Fast-fail exact string and integer literal checks before touching broad
+    // method indexes (return type / param count) that hold tens of thousands of
+    // rows per DEX.
+    let mut exact_string_ids = Vec::new();
+    for need in &filter.strings {
+        if need.mode == LikeMode::Equal && !need.case_insensitive {
+            let Some(string_idx) = file.find_string_idx(&need.value) else {
+                return Some(HashSet::new());
+            };
+            exact_string_ids.push(string_idx);
+        }
+    }
+    for number in &filter.numbers {
+        if !file.method_numbers_by_value.contains_key(number) {
+            return Some(HashSet::new());
+        }
+    }
+
+    let restrict_slice = |candidate: &mut Option<HashSet<u32>>, items: &[u32]| {
+        if items.is_empty() {
+            *candidate = Some(HashSet::new());
+            return;
+        }
+        *candidate = Some(match candidate.take() {
+            None => items.iter().copied().collect(),
+            Some(previous) => {
+                if previous.len() <= items.len() {
+                    let item_set: HashSet<u32> = items.iter().copied().collect();
+                    previous
+                        .into_iter()
+                        .filter(|method| item_set.contains(method))
+                        .collect()
+                } else {
+                    items
+                        .iter()
+                        .copied()
+                        .filter(|method| previous.contains(method))
+                        .collect()
+                }
+            }
+        });
+    };
+
+    if !exact_string_ids.is_empty() {
+        let index = file.string_reference_index();
+        for string_idx in exact_string_ids {
+            let Some(methods) = index.get(&string_idx) else {
+                return Some(HashSet::new());
+            };
+            restrict_slice(&mut candidate, methods);
+            if candidate.as_ref().is_some_and(HashSet::is_empty) {
+                return candidate;
+            }
+        }
+    }
+    for number in &filter.numbers {
+        let Some(methods) = file.method_numbers_by_value.get(number) else {
+            return Some(HashSet::new());
+        };
+        restrict_slice(&mut candidate, methods);
+        if candidate.as_ref().is_some_and(HashSet::is_empty) {
+            return candidate;
+        }
+    }
+    for need in &filter.strings {
+        if need.mode == LikeMode::Equal && !need.case_insensitive {
+            continue;
+        }
+        let strings = string_candidate_methods(file, need);
+        candidate = Some(match candidate {
+            None => strings,
+            Some(previous) => previous
+                .into_iter()
+                .filter(|method| strings.contains(method))
+                .collect(),
+        });
+        if candidate.as_ref().is_some_and(HashSet::is_empty) {
+            return candidate;
+        }
+    }
     if !file.methods_by_class.is_empty() {
-        let mut restrict = |indices: Vec<u32>| {
+        fn restrict(candidate: &mut Option<HashSet<u32>>, indices: Vec<u32>) {
             let indices = indices.into_iter().collect::<HashSet<_>>();
-            candidate = Some(match candidate.take() {
+            *candidate = Some(match candidate.take() {
                 None => indices,
                 Some(previous) => previous.intersection(&indices).copied().collect(),
             });
-        };
-        if !filter.names.is_empty() {
-            restrict(
-                filter
-                    .names
-                    .iter()
-                    .filter_map(|name| file.find_string_idx(name))
-                    .flat_map(|name| {
-                        file.methods_by_name
-                            .get(&name)
-                            .into_iter()
-                            .flatten()
-                            .copied()
-                    })
-                    .collect(),
-            );
         }
-        if !filter.classes.is_empty() {
+        if !filter.classes.is_empty()
+            && candidate
+                .as_ref()
+                .is_none_or(|c| c.len() > BROAD_INDEX_SKIP_THRESHOLD)
+        {
             restrict(
+                &mut candidate,
                 filter
                     .classes
                     .iter()
@@ -1169,74 +1112,37 @@ fn candidate_methods(file: &DexFile, filter: &MethodFilter) -> Option<HashSet<u3
                     })
                     .collect(),
             );
+            if candidate.as_ref().is_some_and(HashSet::is_empty) {
+                return candidate;
+            }
         }
-        if !filter.returns.is_empty()
-            && filter
-                .returns
-                .iter()
-                .all(|need| need.mode == LikeMode::Equal && !need.case_insensitive)
+        if !filter.names.is_empty()
+            && candidate
+                .as_ref()
+                .is_none_or(|c| c.len() > BROAD_INDEX_SKIP_THRESHOLD)
         {
             restrict(
+                &mut candidate,
                 filter
-                    .returns
+                    .names
                     .iter()
-                    .filter_map(|need| file.type_idx_for_descriptor(&need.value))
-                    .flat_map(|returns| {
-                        file.methods_by_return
-                            .get(&returns)
+                    .filter_map(|name| file.find_string_idx(name))
+                    .flat_map(|name| {
+                        file.methods_by_name
+                            .get(&name)
                             .into_iter()
                             .flatten()
                             .copied()
                     })
                     .collect(),
             );
+            if candidate.as_ref().is_some_and(HashSet::is_empty) {
+                return candidate;
+            }
         }
-        if !filter.param_counts.is_empty() {
-            restrict(
-                filter
-                    .param_counts
-                    .iter()
-                    .filter_map(|count| u32::try_from(*count).ok())
-                    .flat_map(|count| {
-                        file.methods_by_param_count
-                            .get(&count)
-                            .into_iter()
-                            .flatten()
-                            .copied()
-                    })
-                    .collect(),
-            );
-        }
-    }
-    for need in &filter.strings {
-        let strings = string_candidate_methods(file, need);
-        candidate = Some(match candidate {
-            None => strings,
-            Some(previous) => previous
-                .into_iter()
-                .filter(|method| strings.contains(method))
-                .collect(),
-        });
-        if candidate.as_ref().is_some_and(HashSet::is_empty) {
-            return candidate;
-        }
-    }
-    for number in &filter.numbers {
-        let numbers: HashSet<u32> = file
-            .method_numbers_by_value
-            .get(number)
-            .map(|methods| methods.iter().copied().collect())
-            .unwrap_or_default();
-        candidate = Some(match candidate {
-            None => numbers,
-            Some(previous) => previous
-                .into_iter()
-                .filter(|method| numbers.contains(method))
-                .collect(),
-        });
-        if candidate.as_ref().is_some_and(HashSet::is_empty) {
-            return candidate;
-        }
+        // Note: broad return-type and param-count indexes are intentionally not
+        // materialized into large HashSets here; `filtered_methods` pre-filters
+        // `file.protos` into a compact bitmask instead.
     }
     for expected in &filter.doubles {
         // The cache has no f64 inverted index; this scan is bounded by the
@@ -1262,15 +1168,267 @@ fn candidate_methods(file: &DexFile, filter: &MethodFilter) -> Option<HashSet<u3
     candidate
 }
 
+fn has_proto_filter(filter: &MethodFilter) -> bool {
+    !filter.returns.is_empty()
+        || !filter.param_counts.is_empty()
+        || !filter.param_count_min.is_empty()
+        || !filter.param_count_max.is_empty()
+        || !filter.param_patterns.is_empty()
+        || !filter.param_pattern_any.is_empty()
+        || !filter.param_descriptors.is_empty()
+}
+
+fn resolve_param_descriptor_targets(file: &DexFile, param_descriptors: &[String]) -> Vec<Vec<u16>> {
+    param_descriptors
+        .iter()
+        .filter_map(|spec| {
+            if spec.is_empty() {
+                return Some(Vec::new());
+            }
+            spec.split(',')
+                .map(|part| {
+                    let idx = file.type_idx_for_descriptor(part)?;
+                    u16::try_from(idx).ok()
+                })
+                .collect::<Option<Vec<u16>>>()
+        })
+        .collect()
+}
+
+fn proto_matches_precompiled(
+    file: &DexFile,
+    proto: &crate::dex::ProtoInfo,
+    filter: &MethodFilter,
+    exact_return_ids: Option<&[u32]>,
+    param_targets: Option<&[Vec<u16>]>,
+) -> bool {
+    if let Some(return_ids) = exact_return_ids {
+        if !return_ids.contains(&proto.return_type_idx) {
+            return false;
+        }
+    } else if !filter.returns.is_empty() {
+        let returns = file.type_descriptor(proto.return_type_idx);
+        if !filter
+            .returns
+            .iter()
+            .any(|need| plain_like_match(returns, need))
+        {
+            return false;
+        }
+    }
+    let param_count = proto.parameters.len() as i64;
+    if !filter.param_counts.is_empty() && !filter.param_counts.contains(&param_count) {
+        return false;
+    }
+    if filter
+        .param_count_min
+        .iter()
+        .any(|minimum| param_count < *minimum)
+    {
+        return false;
+    }
+    if filter
+        .param_count_max
+        .iter()
+        .any(|maximum| param_count > *maximum)
+    {
+        return false;
+    }
+    if let Some(targets) = param_targets {
+        if !targets
+            .iter()
+            .any(|target| proto.parameters.as_slice() == target.as_slice())
+        {
+            return false;
+        }
+    }
+    if !filter.param_patterns.is_empty()
+        && !filter.param_patterns.iter().all(|pattern| {
+            pattern.matches_params(proto.parameters.len(), |index| {
+                file.type_descriptor(proto.parameters[index] as u32)
+            })
+        })
+    {
+        return false;
+    }
+    if !filter.param_pattern_any.is_empty()
+        && !filter.param_pattern_any.iter().any(|pattern| {
+            pattern.matches_params(proto.parameters.len(), |index| {
+                file.type_descriptor(proto.parameters[index] as u32)
+            })
+        })
+    {
+        return false;
+    }
+    true
+}
+
+fn method_matches_non_proto(file: &DexFile, method_idx: u32, filter: &MethodFilter) -> bool {
+    let Some(method) = file.methods.get(method_idx as usize) else {
+        return false;
+    };
+    if !filter.classes.is_empty()
+        || !filter.class_likes.is_empty()
+        || !filter.excluded_class_likes.is_empty()
+    {
+        let class = file.type_descriptor(method.class_idx as u32);
+        if !filter.classes.is_empty() && !filter.classes.iter().any(|value| value == class) {
+            return false;
+        }
+        if !filter.class_likes.is_empty()
+            && !filter
+                .class_likes
+                .iter()
+                .any(|need| plain_like_match(class, need))
+        {
+            return false;
+        }
+        if !filter.excluded_class_likes.is_empty()
+            && filter
+                .excluded_class_likes
+                .iter()
+                .any(|need| plain_like_match(class, need))
+        {
+            return false;
+        }
+    }
+    if !filter.names.is_empty() {
+        let name = file.string(method.name_idx);
+        if !filter.names.iter().any(|value| value == name) {
+            return false;
+        }
+    }
+    if !filter.flags.is_empty() {
+        let Some(flags) = file.method_access_flags(method_idx) else {
+            return false;
+        };
+        let flags = flags as i64;
+        if !filter
+            .flags
+            .iter()
+            .all(|(mask, expected)| flags & mask == *expected)
+        {
+            return false;
+        }
+    }
+    if filter.opcode_count_min.is_some() || filter.opcode_count_max.is_some() {
+        if !file
+            .method_opcode_count_in_range(
+                method_idx,
+                filter.opcode_count_min,
+                filter.opcode_count_max,
+            )
+            .unwrap_or(false)
+        {
+            return false;
+        }
+    }
+    true
+}
+
 fn filtered_methods(file: &DexFile, filter: &MethodFilter) -> Vec<u32> {
+    if filter.is_empty() {
+        return (0..file.methods.len() as u32).collect();
+    }
+    let proto_active = has_proto_filter(filter);
+    let exact_return_ids = if !filter.returns.is_empty()
+        && filter
+            .returns
+            .iter()
+            .all(|need| need.mode == LikeMode::Equal && !need.case_insensitive)
+    {
+        let ids: Vec<u32> = filter
+            .returns
+            .iter()
+            .filter_map(|need| file.type_idx_for_descriptor(&need.value))
+            .collect();
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        Some(ids)
+    } else {
+        None
+    };
+    let param_targets = if !filter.param_descriptors.is_empty() {
+        let targets = resolve_param_descriptor_targets(file, &filter.param_descriptors);
+        if targets.is_empty() {
+            return Vec::new();
+        }
+        Some(targets)
+    } else {
+        None
+    };
+
     match candidate_methods(file, filter) {
-        Some(candidates) => candidates
-            .into_iter()
-            .filter(|method| method_matches(file, *method, filter))
-            .collect(),
-        None => (0..file.methods.len() as u32)
-            .filter(|method| method_matches(file, *method, filter))
-            .collect(),
+        Some(candidates) => {
+            if candidates.is_empty() {
+                return Vec::new();
+            }
+            candidates
+                .into_iter()
+                .filter(|&method_idx| {
+                    if proto_active {
+                        let Some(method) = file.methods.get(method_idx as usize) else {
+                            return false;
+                        };
+                        let Some(proto) = file.protos.get(method.proto_idx as usize) else {
+                            return false;
+                        };
+                        if !proto_matches_precompiled(
+                            file,
+                            proto,
+                            filter,
+                            exact_return_ids.as_deref(),
+                            param_targets.as_deref(),
+                        ) {
+                            return false;
+                        }
+                    }
+                    method_matches_non_proto(file, method_idx, filter)
+                })
+                .collect()
+        }
+        None => {
+            let proto_mask = if proto_active {
+                let mut mask = vec![false; file.protos.len()];
+                let mut matched_any = false;
+                for (proto_idx, proto) in file.protos.iter().enumerate() {
+                    if proto_matches_precompiled(
+                        file,
+                        proto,
+                        filter,
+                        exact_return_ids.as_deref(),
+                        param_targets.as_deref(),
+                    ) {
+                        mask[proto_idx] = true;
+                        matched_any = true;
+                    }
+                }
+                if !matched_any {
+                    return Vec::new();
+                }
+                Some(mask)
+            } else {
+                None
+            };
+            let mut out = Vec::new();
+            for (index, method) in file.methods.iter().enumerate() {
+                if let Some(mask) = &proto_mask {
+                    if !mask
+                        .get(method.proto_idx as usize)
+                        .copied()
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                }
+                let method_idx = index as u32;
+                if method_matches_non_proto(file, method_idx, filter) {
+                    out.push(method_idx);
+                }
+            }
+            out
+        }
     }
 }
 
@@ -3780,43 +3938,215 @@ fn annotation_owner_lookup(
         return None;
     }
     let limit = query_limit(query)?;
+    let owners: Vec<String> = dataset
+        .files
+        .par_iter()
+        .flat_map(|file| {
+            annotation_owners_in_file(file, kind, annotation, visibility, element_name, string)
+        })
+        .collect();
+    Some(apply_limit(owners, label, limit, cli_limit))
+}
+
+fn annotation_owners_in_file(
+    file: &DexFile,
+    kind: &str,
+    annotation: Option<&str>,
+    visibility: Option<i64>,
+    element_name: Option<&str>,
+    string: Option<(&str, LikeMode)>,
+) -> Vec<String> {
+    let want_type_idx = match annotation {
+        Some(want) => match file.type_idx_for_descriptor(want) {
+            Some(idx) => Some(idx),
+            None => return Vec::new(),
+        },
+        None => None,
+    };
+    let want_elem_idx = match element_name {
+        Some(want) => match file.find_string_idx(want) {
+            Some(idx) => Some(idx),
+            None => return Vec::new(),
+        },
+        None => None,
+    };
+    let want_string_idx = match string {
+        Some((value, LikeMode::Equal)) => match file.find_string_idx(value) {
+            Some(idx) => Some(idx),
+            None => return Vec::new(),
+        },
+        _ => None,
+    };
+    let raw = file.raw();
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    let class_defs_off = file.class_defs_off as usize;
     let mut owners = Vec::new();
-    for file in &dataset.files {
-        let string_index = match string {
-            Some((value, LikeMode::Equal)) => match file.find_string_idx(value) {
-                Some(index) => Some(index),
-                None => continue,
-            },
-            _ => None,
-        };
-        for (_, _, _, _, owner, offset) in super::annotation_owner_rows(file, Some(kind)) {
-            let (actual_visibility, type_idx, elements, _) =
-                super::read_annotation_instance(file.raw(), offset as usize);
-            if visibility.is_some_and(|want| want != i64::from(actual_visibility))
-                || annotation.is_some_and(|want| want != file.type_descriptor(type_idx))
-            {
-                continue;
+    for class in &file.classes {
+        let dir = super::read_u32_at(raw, class_defs_off + class.class_def_idx as usize * 32 + 20);
+        if dir == 0 {
+            continue;
+        }
+        let dir_off = dir as usize;
+        if kind == "class" {
+            let set = super::read_u32_at(raw, dir_off);
+            if annotation_set_matches(
+                file,
+                raw,
+                set,
+                visibility,
+                want_type_idx,
+                want_elem_idx,
+                string,
+                want_string_idx,
+            ) {
+                owners.push(file.type_descriptor(class.class_idx).to_owned());
             }
-            if let Some((expected, mode)) = string {
-                if !elements.iter().any(|(name, value)| {
-                    element_name.is_none_or(|wanted| wanted == file.string(*name))
-                        && value.kind == "string"
-                        && value.index.is_some_and(|index| match mode {
-                            LikeMode::Equal => Some(index) == string_index,
-                            LikeMode::Contains => file.string(index).contains(expected),
-                            LikeMode::Prefix => file.string(index).starts_with(expected),
-                            LikeMode::Suffix => file.string(index).ends_with(expected),
-                        })
-                }) {
-                    continue;
+            continue;
+        }
+        let fields = super::read_u32_at(raw, dir_off + 4) as usize;
+        let methods = super::read_u32_at(raw, dir_off + 8) as usize;
+        let mut pos = dir_off + 16;
+        if kind == "field" {
+            for _ in 0..fields {
+                let idx = super::read_u32_at(raw, pos);
+                let set = super::read_u32_at(raw, pos + 4);
+                pos += 8;
+                if annotation_set_matches(
+                    file,
+                    raw,
+                    set,
+                    visibility,
+                    want_type_idx,
+                    want_elem_idx,
+                    string,
+                    want_string_idx,
+                ) {
+                    owners.push(file.field_descriptor_direct(idx));
                 }
             }
-            if let Some(owner) = owner {
-                owners.push(owner);
+        } else {
+            pos += fields * 8;
+            for _ in 0..methods {
+                let idx = super::read_u32_at(raw, pos);
+                let set = super::read_u32_at(raw, pos + 4);
+                pos += 8;
+                if annotation_set_matches(
+                    file,
+                    raw,
+                    set,
+                    visibility,
+                    want_type_idx,
+                    want_elem_idx,
+                    string,
+                    want_string_idx,
+                ) {
+                    owners.push(file.method_descriptor_direct(idx));
+                }
             }
         }
     }
-    Some(apply_limit(owners, label, limit, cli_limit))
+    owners
+}
+
+#[allow(clippy::too_many_arguments)]
+fn annotation_set_matches(
+    file: &DexFile,
+    raw: &[u8],
+    set: u32,
+    visibility: Option<i64>,
+    want_type_idx: Option<u32>,
+    want_elem_idx: Option<u32>,
+    string: Option<(&str, LikeMode)>,
+    want_string_idx: Option<u32>,
+) -> bool {
+    if set == 0 {
+        return false;
+    }
+    let set_off = set as usize;
+    let count = super::read_u32_at(raw, set_off) as usize;
+    for ordinal in 0..count {
+        let ann_off = super::read_u32_at(raw, set_off + 4 + ordinal * 4) as usize;
+        let actual_visibility = raw.get(ann_off).copied().unwrap_or(0) as i64;
+        if visibility.is_some_and(|want| want != actual_visibility) {
+            continue;
+        }
+        let (type_idx, mut pos) = super::read_uleb_at(raw, ann_off + 1);
+        if want_type_idx.is_some_and(|want| want != type_idx) {
+            continue;
+        }
+        let Some((expected, mode)) = string else {
+            return true;
+        };
+        let (elem_count, next) = super::read_uleb_at(raw, pos);
+        pos = next;
+        for _ in 0..elem_count {
+            let (name_idx, next) = super::read_uleb_at(raw, pos);
+            pos = next;
+            let header = raw.get(pos).copied().unwrap_or(0);
+            let value_type = header & 0x1f;
+            let value_arg = (header >> 5) as usize;
+            if value_type == 0x17 {
+                // VALUE_STRING: unsigned little-endian string_idx of width (value_arg + 1).
+                let width = (value_arg + 1).min(4);
+                let mut str_idx = 0u32;
+                for i in 0..width {
+                    str_idx |= (raw.get(pos + 1 + i).copied().unwrap_or(0) as u32) << (i * 8);
+                }
+                pos += 1 + width;
+                if want_elem_idx.is_none_or(|want| want == name_idx) {
+                    let matched = match mode {
+                        LikeMode::Equal => Some(str_idx) == want_string_idx,
+                        LikeMode::Contains => file.string(str_idx).contains(expected),
+                        LikeMode::Prefix => file.string(str_idx).starts_with(expected),
+                        LikeMode::Suffix => file.string(str_idx).ends_with(expected),
+                    };
+                    if matched {
+                        return true;
+                    }
+                }
+            } else {
+                pos = skip_encoded_value(raw, pos, 0);
+            }
+        }
+    }
+    false
+}
+
+fn skip_encoded_value(raw: &[u8], pos: usize, depth: usize) -> usize {
+    let Some(&header) = raw.get(pos) else {
+        return pos + 1;
+    };
+    if depth > 64 {
+        return pos + 1;
+    }
+    let typ = header & 0x1f;
+    let arg = (header >> 5) as usize;
+    let mut cur = pos + 1;
+    match typ {
+        0x1c => {
+            let (n, next) = super::read_uleb_at(raw, cur);
+            cur = next;
+            for _ in 0..n {
+                cur = skip_encoded_value(raw, cur, depth + 1).max(cur + 1);
+            }
+            cur
+        }
+        0x1d => {
+            let (_, next) = super::read_uleb_at(raw, cur);
+            let (n, next) = super::read_uleb_at(raw, next);
+            cur = next;
+            for _ in 0..n {
+                let (_, next) = super::read_uleb_at(raw, cur);
+                cur = skip_encoded_value(raw, next, depth + 1).max(next + 1);
+            }
+            cur
+        }
+        0x1e | 0x1f => cur,
+        0x10 => cur + (arg + 1).min(4),
+        _ => cur + (arg + 1).min(8),
+    }
 }
 
 #[cfg(test)]

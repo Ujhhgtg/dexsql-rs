@@ -7,7 +7,8 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use dexsql_core::dex::metadata::CrossRefCache;
 pub use dexsql_core::dex::IndexNeeds;
@@ -93,8 +94,9 @@ impl From<LoadError> for Error {
 /// Immutable DEX/APK analysis session.
 pub struct Engine {
     dataset: Arc<Dataset>,
+    has_named_caches: AtomicBool,
     named_caches: Mutex<NamedCaches>,
-    result_cache: Mutex<HashMap<String, ResultSet>>,
+    result_cache: RwLock<HashMap<String, ResultSet>>,
     /// Lazy DexKit-compatible cross-DEX bindings for nested metadata refs.
     metadata_cross_refs: OnceLock<CrossRefCache>,
 }
@@ -155,8 +157,9 @@ impl Engine {
         )?;
         Ok(Self {
             dataset: Arc::new(dataset),
+            has_named_caches: AtomicBool::new(false),
             named_caches: Mutex::new(NamedCaches::default()),
-            result_cache: Mutex::new(HashMap::new()),
+            result_cache: RwLock::new(HashMap::new()),
             metadata_cross_refs: OnceLock::new(),
         })
     }
@@ -233,30 +236,45 @@ impl Engine {
 
     /// Execute a read-only SQL statement against this session.
     pub fn query(&self, sql: &str) -> Result<ResultSet, Error> {
-        if let Some(cached) = self
-            .result_cache
-            .lock()
-            .expect("dexsql result cache mutex poisoned")
-            .get(sql)
-            .cloned()
-        {
-            return Ok(cached);
+        let is_create = sql
+            .trim_start()
+            .get(..6)
+            .is_some_and(|head| head.eq_ignore_ascii_case("CREATE"));
+        if !is_create {
+            if let Some(cached) = self
+                .result_cache
+                .read()
+                .expect("dexsql result cache rwlock poisoned")
+                .get(sql)
+                .cloned()
+            {
+                return Ok(cached);
+            }
         }
-        let result = execute_statement(
-            sql,
-            Some(&self.dataset),
-            &self
+        let result = if !is_create && !self.has_named_caches.load(Ordering::Acquire) {
+            // Fast path: no session-scoped CREATE caches exist, so a stack-local
+            // empty NamedCaches avoids serializing concurrent queries on a mutex.
+            let local_caches = NamedCaches::default();
+            execute_statement(sql, Some(&self.dataset), &local_caches, None)
+        } else {
+            let guard = self
                 .named_caches
                 .lock()
-                .expect("dexsql named cache mutex poisoned"),
-            None,
-        )
+                .expect("dexsql named cache mutex poisoned");
+            let res = execute_statement(sql, Some(&self.dataset), &guard, None);
+            if is_create && res.is_ok() {
+                self.has_named_caches.store(true, Ordering::Release);
+            }
+            res
+        }
         .map(ResultSet::from)
         .map_err(Error::Query)?;
-        self.result_cache
-            .lock()
-            .expect("dexsql result cache mutex poisoned")
-            .insert(sql.to_owned(), result.clone());
+        if !is_create {
+            self.result_cache
+                .write()
+                .expect("dexsql result cache rwlock poisoned")
+                .insert(sql.to_owned(), result.clone());
+        }
         Ok(result)
     }
 

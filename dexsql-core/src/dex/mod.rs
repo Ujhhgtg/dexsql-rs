@@ -542,24 +542,106 @@ impl DexFile {
     }
 
     /// Return the reference CLI's compact opcode projection for a defined
+    fn method_code_offset(&self, method_idx: u32) -> u32 {
+        let offsets = self.method_code_offsets.get_or_init(|| {
+            let mut offsets = vec![0; self.methods.len()];
+            for class in &self.classes {
+                for method in &class.methods {
+                    if let Some(offset) = offsets.get_mut(method.method_idx as usize) {
+                        *offset = method.code_off;
+                    }
+                }
+            }
+            offsets
+        });
+        offsets.get(method_idx as usize).copied().unwrap_or(0)
+    }
+
+    fn borrowed_code_insns(&self, method_idx: u32) -> Option<&[u16]> {
+        if let Some(code) = self
+            .code_items
+            .get(method_idx as usize)
+            .and_then(Option::as_ref)
+        {
+            return Some(&code.insns);
+        }
+        let raw = self.raw();
+        if raw.is_empty() {
+            return None;
+        }
+        let code_off = self.method_code_offset(method_idx);
+        if code_off == 0 {
+            return None;
+        }
+        let off = code_off as usize;
+        let insns_size = read_u32(raw, off + 12).ok()? as usize;
+        let start = off.checked_add(16)?;
+        checked_range(raw, start as u32, insns_size as u32, 2).ok()?;
+        // DEX code items are 4-byte aligned little-endian u16 code units.
+        let insns: &[u16] = unsafe {
+            std::slice::from_raw_parts(raw.as_ptr().add(start) as *const u16, insns_size)
+        };
+        Some(insns)
+    }
+
+    /// Count of non-payload Dalvik instructions in the code item of this
     /// method.  `None` means the method has no code item (external/abstract),
     /// which is rendered as SQL NULL in the methods relation.
-    pub fn method_opcode_count(&self, method_idx: u32) -> Option<usize> {
-        // A full prepare load materializes at least one code item and uses
-        // `None` to represent external/abstract methods.  Do not fall back to
-        // the O(classes × methods) lookup for those None slots; that fallback
-        // remains necessary only for lazy query loads.
-        if self.code_items.iter().any(Option::is_some) {
-            return self
-                .code_items
-                .get(method_idx as usize)
-                .and_then(Option::as_ref)
-                .map(|code| code.opcode_count as usize);
+    /// Checks whether the method's opcode count lies within `[min, max]` without decoding past the bound.
+    pub fn method_opcode_count_in_range(
+        &self,
+        method_idx: u32,
+        min: Option<i64>,
+        max: Option<i64>,
+    ) -> Option<bool> {
+        if let Some(code) = self
+            .code_items
+            .get(method_idx as usize)
+            .and_then(Option::as_ref)
+        {
+            let count = code.opcode_count as i64;
+            return Some(
+                min.is_none_or(|minimum| count >= minimum)
+                    && max.is_none_or(|maximum| count <= maximum),
+            );
         }
-        self.decode_code_item(method_idx)
-            .ok()
-            .flatten()
-            .map(|code| code.opcode_count as usize)
+        let insns = self.borrowed_code_insns(method_idx)?;
+        if max.is_some_and(|maximum| maximum < 0) {
+            return Some(false);
+        }
+        if let (Some(minimum), Some(maximum)) = (min, max) {
+            if minimum > maximum {
+                return Some(false);
+            }
+        }
+        let limit = if let Some(maximum) = max {
+            Some(maximum as usize)
+        } else if let Some(minimum) = min {
+            if minimum <= 0 {
+                return Some(true);
+            }
+            Some((minimum - 1) as usize)
+        } else {
+            return Some(true);
+        };
+        let count = count_method_opcodes_until(insns, limit) as i64;
+        Some(
+            min.is_none_or(|minimum| count >= minimum)
+                && max.is_none_or(|maximum| count <= maximum),
+        )
+    }
+
+    /// Returns the instruction opcode count of a method without building a full opcode summary.
+    pub fn method_opcode_count(&self, method_idx: u32) -> Option<usize> {
+        if let Some(code) = self
+            .code_items
+            .get(method_idx as usize)
+            .and_then(Option::as_ref)
+        {
+            return Some(code.opcode_count as usize);
+        }
+        let insns = self.borrowed_code_insns(method_idx)?;
+        Some(count_method_opcodes_until(insns, None))
     }
 
     /// Access flags of a method defined in this DEX, or None for an external
@@ -572,26 +654,15 @@ impl DexFile {
     }
 
     pub fn method_opcode_summary(&self, method_idx: u32) -> Option<(usize, String)> {
-        let decoded;
-        let code = match self
-            .code_items
-            .get(method_idx as usize)
-            .and_then(Option::as_ref)
-        {
-            Some(code) => code,
-            None => {
-                decoded = self.decode_code_item(method_idx).ok().flatten()?;
-                &decoded
-            }
-        };
+        let insns = self.borrowed_code_insns(method_idx)?;
         const HEX: &[u8; 16] = b"0123456789abcdef";
         let mut pc = 0usize;
         let mut count = 0usize;
-        let mut hex = String::with_capacity(code.opcode_count as usize * 3);
-        while pc < code.insns.len() {
-            let opcode = (code.insns[pc] & 0xff) as u8;
-            let width = opcode_width(opcode, &code.insns, pc).max(1);
-            if !is_payload_opcode(&code.insns, pc) {
+        let mut hex = String::with_capacity(insns.len() * 2);
+        while pc < insns.len() {
+            let opcode = (insns[pc] & 0xff) as u8;
+            let width = opcode_width(opcode, insns, pc).max(1);
+            if !is_payload_opcode(insns, pc) {
                 if count != 0 {
                     hex.push(' ');
                 }
@@ -4839,13 +4910,22 @@ fn parse_dex(
         }),
         method_numbers_by_value: HashMap::new(),
         method_number_rows_by_value: FxHashMap::default(),
-        method_calls: Vec::new(),
-        method_field_accesses: Vec::new(),
+        method_calls: Vec::with_capacity(if index_needs.method_calls {
+            method_count as usize * 4
+        } else {
+            0
+        }),
+        method_field_accesses: Vec::with_capacity(if index_needs.method_field_accesses {
+            method_count as usize * 2
+        } else {
+            0
+        }),
         method_used_types: Vec::new(),
         meta: MetadataIndexes::default(),
     };
     if index_needs.any() {
         if eager_code_items && !full_code_items {
+            code_offsets.sort_unstable_by_key(|&(method_idx, _)| method_idx);
             derive_code_indexes_from_offsets(&mut dex, &code_offsets, index_needs)?;
         } else {
             derive_code_indexes(&mut dex, index_needs);
@@ -5679,6 +5759,23 @@ fn finish_method_number_values(dex: &mut DexFile) {
     }
 }
 
+fn count_method_opcodes_until(insns: &[u16], limit: Option<usize>) -> usize {
+    let mut pc = 0usize;
+    let mut count = 0usize;
+    while pc < insns.len() {
+        let opcode = (insns[pc] & 0xff) as u8;
+        let width = opcode_width(opcode, insns, pc).max(1);
+        if !is_payload_opcode(insns, pc) {
+            count = count.saturating_add(1);
+            if limit.is_some_and(|bound| count > bound) {
+                break;
+            }
+        }
+        pc = pc.saturating_add(width);
+    }
+    count
+}
+
 #[inline(always)]
 fn is_payload_opcode(insns: &[u16], pc: usize) -> bool {
     insns
@@ -6271,6 +6368,52 @@ mod tests {
         let legacy = Dataset::load_paths_with_requirements(&[path], needs, true, false, true)
             .expect("legacy fixture load");
         assert!(legacy.files[0].bytes.is_some());
+    }
+
+    #[test]
+    fn method_opcode_count_in_range_matches_full_count() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../fixtures/dex/alpha.dex");
+        let full = Dataset::load_paths(std::slice::from_ref(&path)).expect("full fixture load");
+        let lazy = Dataset::load_paths_with_retention(
+            std::slice::from_ref(&path),
+            IndexNeeds::default(),
+            false,
+            false,
+            true,
+            true,
+        )
+        .expect("lazy fixture load");
+        assert!(lazy.files[0].code_items.is_empty());
+        let bounds = [
+            (None, None),
+            (Some(0), None),
+            (Some(1), None),
+            (Some(2), Some(5)),
+            (None, Some(0)),
+            (None, Some(1)),
+            (None, Some(2)),
+            (None, Some(-1)),
+            (Some(5), Some(2)),
+        ];
+        for method_idx in 0..full.files[0].methods.len() as u32 {
+            let full_count = full.files[0].method_opcode_count(method_idx);
+            let lazy_count = lazy.files[0].method_opcode_count(method_idx);
+            assert_eq!(lazy_count, full_count);
+            for (min, max) in bounds {
+                let expected = full_count.map(|c| {
+                    let c = c as i64;
+                    min.is_none_or(|m| c >= m) && max.is_none_or(|m| c <= m)
+                });
+                assert_eq!(
+                    full.files[0].method_opcode_count_in_range(method_idx, min, max),
+                    expected
+                );
+                assert_eq!(
+                    lazy.files[0].method_opcode_count_in_range(method_idx, min, max),
+                    expected
+                );
+            }
+        }
     }
 
     #[test]

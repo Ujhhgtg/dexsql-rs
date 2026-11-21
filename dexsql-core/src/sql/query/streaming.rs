@@ -1177,6 +1177,17 @@ impl<'a> Cells<'a> {
         cells.fields.clear();
         cells
     }
+    /// Lightweight uncached cell decoder that skips all dense pool allocations,
+    /// including the full-file method-definition map.
+    fn light(file: &'a DexFile) -> Self {
+        Self {
+            file,
+            strings: Vec::new(),
+            methods: Vec::new(),
+            fields: Vec::new(),
+            definitions: Vec::new(),
+        }
+    }
 
     fn string(&mut self, index: u32) -> Scalar {
         let Some(slot) = self.strings.get_mut(index as usize) else {
@@ -1468,7 +1479,22 @@ impl<'a> Cells<'a> {
             Source::Method(index) => {
                 let proto =
                     method.and_then(|method| self.file.protos.get(method.proto_idx as usize));
-                let meta = self.definitions.get(index as usize).copied().flatten();
+                let meta = if !self.definitions.is_empty() {
+                    self.definitions.get(index as usize).copied().flatten()
+                } else if matches!(
+                    column,
+                    "access_flags" | "method_kind" | "opcode_count" | "opcode_hex"
+                ) {
+                    self.file.class_for_method(index).and_then(|class| {
+                        class
+                            .methods
+                            .iter()
+                            .find(|member| member.method_idx == index)
+                            .map(|member| (member.access_flags, member.is_direct))
+                    })
+                } else {
+                    None
+                };
                 match column {
                     "proto_idx" => method
                         .map(|method| Scalar::Int(method.proto_idx as i64))
@@ -1742,8 +1768,35 @@ fn visit_source_records_filtered<'a>(
     let return_descriptors = (table == "methods")
         .then(|| candidates("return_descriptor"))
         .flatten();
+    let method_names = matches!(table, "methods" | "method_ids")
+        .then(|| candidates("name"))
+        .flatten();
+    let superclass_descriptors = (table == "classes")
+        .then(|| candidates("superclass_descriptor"))
+        .flatten();
+    let interface_descriptors = (table == "class_interfaces")
+        .then(|| candidates("interface_descriptor"))
+        .flatten();
+    let class_method_names = (table == "class_methods")
+        .then(|| candidates("method_name"))
+        .flatten();
+    let callee_classes = (table == "method_calls")
+        .then(|| candidates("callee_class"))
+        .flatten();
+    let callee_names = (table == "method_calls")
+        .then(|| candidates("callee_name"))
+        .flatten();
     let field_descriptors = (table == "method_field_accesses")
         .then(|| candidates("field"))
+        .flatten();
+    let field_access_classes = (table == "method_field_accesses")
+        .then(|| candidates("field_class"))
+        .flatten();
+    let field_access_names = (table == "method_field_accesses")
+        .then(|| candidates("field_name"))
+        .flatten();
+    let field_access_types = (table == "method_field_accesses")
+        .then(|| candidates("field_type"))
         .flatten();
     let field_types = candidates(if table == "class_fields" {
         "field_type"
@@ -1755,6 +1808,8 @@ fn visit_source_records_filtered<'a>(
     } else {
         "name"
     });
+    let (layout, mut row) = RowLayout::new(alias, columns);
+    const LIGHT_CELLS_THRESHOLD: usize = 1024;
     for (file_index, file) in ds.files.iter().enumerate() {
         let class_ids = class_descriptors.as_ref().map(|descriptors| {
             descriptors
@@ -1766,6 +1821,30 @@ fn visit_source_records_filtered<'a>(
             descriptors
                 .iter()
                 .filter_map(|descriptor| file.type_idx_for_descriptor(descriptor))
+                .collect::<HashSet<_>>()
+        });
+        let method_name_ids = method_names.as_ref().map(|names| {
+            names
+                .iter()
+                .filter_map(|name| file.find_string_idx(name))
+                .collect::<HashSet<_>>()
+        });
+        let superclass_ids = superclass_descriptors.as_ref().map(|descriptors| {
+            descriptors
+                .iter()
+                .filter_map(|descriptor| file.type_idx_for_descriptor(descriptor))
+                .collect::<HashSet<_>>()
+        });
+        let interface_ids = interface_descriptors.as_ref().map(|descriptors| {
+            descriptors
+                .iter()
+                .filter_map(|descriptor| file.type_idx_for_descriptor(descriptor))
+                .collect::<HashSet<_>>()
+        });
+        let class_method_name_ids = class_method_names.as_ref().map(|names| {
+            names
+                .iter()
+                .filter_map(|name| file.find_string_idx(name))
                 .collect::<HashSet<_>>()
         });
         let field_type_ids = field_types.as_ref().map(|descriptors| {
@@ -1793,13 +1872,532 @@ fn visit_source_records_filtered<'a>(
                 .collect::<Option<Vec<_>>>()
                 .map(|classes| classes.into_iter().flatten().collect::<HashSet<_>>())
         });
-        let mut cells = Cells::new(
-            file,
-            table,
-            needs_definitions && table == "methods",
-            columns,
-        );
-        let (layout, mut row) = RowLayout::new(alias, columns);
+
+        // Pre-resolve narrow/indexed per-file worksets BEFORE allocating dense Cells pools,
+        // skipping DEX files that cannot match any row.
+        enum FilePlan<'f> {
+            Full,
+            Methods(Vec<u32>),
+            ClassOrdinals(Vec<u32>),
+            Fields(Vec<u32>),
+            CallMethods {
+                methods: Vec<u32>,
+                targets: Option<HashSet<u32>>,
+            },
+            FieldAccessRefs(Vec<&'f crate::dex::MethodFieldRef>),
+        }
+
+        let (plan, use_light_cells) = match table {
+            "methods" | "method_ids" => {
+                if class_ids.as_ref().is_some_and(HashSet::is_empty)
+                    || return_ids.as_ref().is_some_and(HashSet::is_empty)
+                    || method_name_ids.as_ref().is_some_and(HashSet::is_empty)
+                {
+                    continue;
+                }
+                if let Some(methods) = method_candidates {
+                    let slice = &methods[file_index];
+                    if slice.is_empty() {
+                        continue;
+                    }
+                    let filtered: Vec<u32> = slice
+                        .iter()
+                        .copied()
+                        .filter(|&index| {
+                            let method = &file.methods[index as usize];
+                            class_ids
+                                .as_ref()
+                                .is_none_or(|ids| ids.contains(&(method.class_idx as u32)))
+                                && method_name_ids
+                                    .as_ref()
+                                    .is_none_or(|ids| ids.contains(&method.name_idx))
+                                && return_ids.as_ref().is_none_or(|ids| {
+                                    ids.contains(
+                                        &file.protos[method.proto_idx as usize].return_type_idx,
+                                    )
+                                })
+                        })
+                        .collect();
+                    if filtered.is_empty() {
+                        continue;
+                    }
+                    let light = filtered.len() <= LIGHT_CELLS_THRESHOLD;
+                    (FilePlan::Methods(filtered), light)
+                } else if class_ids.is_some() || method_name_ids.is_some() || return_ids.is_some() {
+                    let mut best: Option<Vec<u32>> = None;
+                    let mut consider =
+                        |ids: &HashSet<u32>, map: &rustc_hash::FxHashMap<u32, Vec<u32>>| {
+                            let total: usize =
+                                ids.iter().filter_map(|id| map.get(id)).map(Vec::len).sum();
+                            if best.as_ref().is_none_or(|cur| total < cur.len()) {
+                                let mut list = Vec::with_capacity(total);
+                                for id in ids {
+                                    if let Some(entries) = map.get(id) {
+                                        list.extend_from_slice(entries);
+                                    }
+                                }
+                                best = Some(list);
+                            }
+                        };
+                    if let Some(ids) = &class_ids {
+                        consider(ids, &file.methods_by_class);
+                    }
+                    if let Some(ids) = &method_name_ids {
+                        consider(ids, &file.methods_by_name);
+                    }
+                    if let Some(ids) = &return_ids {
+                        consider(ids, &file.methods_by_return);
+                    }
+                    let mut list = best.unwrap_or_default();
+                    list.retain(|&index| {
+                        let method = &file.methods[index as usize];
+                        class_ids
+                            .as_ref()
+                            .is_none_or(|ids| ids.contains(&(method.class_idx as u32)))
+                            && method_name_ids
+                                .as_ref()
+                                .is_none_or(|ids| ids.contains(&method.name_idx))
+                            && return_ids.as_ref().is_none_or(|ids| {
+                                ids.contains(
+                                    &file.protos[method.proto_idx as usize].return_type_idx,
+                                )
+                            })
+                    });
+                    if list.is_empty() {
+                        continue;
+                    }
+                    list.sort_unstable();
+                    list.dedup();
+                    let light = list.len() <= LIGHT_CELLS_THRESHOLD;
+                    (FilePlan::Methods(list), light)
+                } else {
+                    (FilePlan::Full, false)
+                }
+            }
+            "classes" => {
+                if class_ids.as_ref().is_some_and(HashSet::is_empty)
+                    || superclass_ids.as_ref().is_some_and(HashSet::is_empty)
+                {
+                    continue;
+                }
+                if class_ids.is_some() || superclass_ids.is_some() {
+                    let mut ordinals = Vec::new();
+                    if let Some(ids) = &class_ids {
+                        let index = file.class_descriptor_index();
+                        for id in ids {
+                            if let Some(entries) = index.get(id) {
+                                ordinals.extend_from_slice(entries);
+                            }
+                        }
+                    } else if let Some(ids) = &superclass_ids {
+                        let index = file.class_superclass_index();
+                        for id in ids {
+                            if let Some(entries) = index.get(id) {
+                                ordinals.extend_from_slice(entries);
+                            }
+                        }
+                    }
+                    if let Some(ids) = &superclass_ids {
+                        ordinals.retain(|&ord| {
+                            file.classes[ord as usize]
+                                .superclass_idx
+                                .is_some_and(|sup| ids.contains(&sup))
+                        });
+                    }
+                    if ordinals.is_empty() {
+                        continue;
+                    }
+                    ordinals.sort_unstable();
+                    ordinals.dedup();
+                    let light = ordinals.len() <= LIGHT_CELLS_THRESHOLD;
+                    (FilePlan::ClassOrdinals(ordinals), light)
+                } else {
+                    (FilePlan::Full, false)
+                }
+            }
+            "class_methods" | "class_fields" | "class_interfaces" => {
+                if class_ids.as_ref().is_some_and(HashSet::is_empty)
+                    || member_classes.as_ref().is_some_and(HashSet::is_empty)
+                    || (table == "class_fields"
+                        && (field_type_ids.as_ref().is_some_and(HashSet::is_empty)
+                            || field_name_ids.as_ref().is_some_and(HashSet::is_empty)))
+                    || (table == "class_interfaces"
+                        && interface_ids.as_ref().is_some_and(HashSet::is_empty))
+                    || (table == "class_methods"
+                        && class_method_name_ids
+                            .as_ref()
+                            .is_some_and(HashSet::is_empty))
+                {
+                    continue;
+                }
+                if class_ids.is_some() || member_classes.is_some() {
+                    let seed = match (&class_ids, &member_classes) {
+                        (Some(a), Some(b)) => {
+                            if a.len() <= b.len() {
+                                a
+                            } else {
+                                b
+                            }
+                        }
+                        (Some(a), None) => a,
+                        (None, Some(b)) => b,
+                        (None, None) => unreachable!(),
+                    };
+                    let index = file.class_descriptor_index();
+                    let mut ordinals = Vec::new();
+                    for id in seed {
+                        if class_ids.as_ref().is_none_or(|ids| ids.contains(id))
+                            && member_classes.as_ref().is_none_or(|ids| ids.contains(id))
+                        {
+                            if let Some(entries) = index.get(id) {
+                                ordinals.extend_from_slice(entries);
+                            }
+                        }
+                    }
+                    if ordinals.is_empty() {
+                        continue;
+                    }
+                    ordinals.sort_unstable();
+                    ordinals.dedup();
+                    let light = ordinals.len() <= 256;
+                    (FilePlan::ClassOrdinals(ordinals), light)
+                } else {
+                    (FilePlan::Full, false)
+                }
+            }
+            "fields" | "field_ids" => {
+                if class_ids.as_ref().is_some_and(HashSet::is_empty)
+                    || field_type_ids.as_ref().is_some_and(HashSet::is_empty)
+                    || field_name_ids.as_ref().is_some_and(HashSet::is_empty)
+                {
+                    continue;
+                }
+                if class_ids.is_some() || field_name_ids.is_some() || field_type_ids.is_some() {
+                    let mut list = Vec::new();
+                    if let Some(ids) = &class_ids {
+                        for &cid in ids {
+                            for field_idx in file.field_range_for_type(cid) {
+                                let field = &file.fields[field_idx as usize];
+                                if field_type_ids
+                                    .as_ref()
+                                    .is_none_or(|tids| tids.contains(&(field.type_idx as u32)))
+                                    && field_name_ids
+                                        .as_ref()
+                                        .is_none_or(|nids| nids.contains(&field.name_idx))
+                                {
+                                    list.push(field_idx);
+                                }
+                            }
+                        }
+                    } else if let Some(ids) = &field_name_ids {
+                        let index = file.field_name_index();
+                        for nid in ids {
+                            if let Some(entries) = index.get(nid) {
+                                for &field_idx in entries {
+                                    let field = &file.fields[field_idx as usize];
+                                    if field_type_ids
+                                        .as_ref()
+                                        .is_none_or(|tids| tids.contains(&(field.type_idx as u32)))
+                                    {
+                                        list.push(field_idx);
+                                    }
+                                }
+                            }
+                        }
+                    } else if let Some(tids) = &field_type_ids {
+                        for (idx, field) in file.fields.iter().enumerate() {
+                            if tids.contains(&(field.type_idx as u32)) {
+                                list.push(idx as u32);
+                            }
+                        }
+                    }
+                    if list.is_empty() {
+                        continue;
+                    }
+                    list.sort_unstable();
+                    list.dedup();
+                    let light = list.len() <= LIGHT_CELLS_THRESHOLD;
+                    (FilePlan::Fields(list), light)
+                } else {
+                    (FilePlan::Full, false)
+                }
+            }
+            "method_calls" => {
+                if call_targets.is_some() || call_sources.is_some() {
+                    let resolve = |descriptors: &[String]| -> HashSet<u32> {
+                        descriptors
+                            .iter()
+                            .filter_map(|descriptor| {
+                                let parts =
+                                    crate::dex::metadata::parse_method_descriptor(descriptor)
+                                        .ok()?;
+                                let class = file.type_idx_for_descriptor(parts.class_descriptor)?;
+                                file.method_reference_for_type(class, &parts)
+                            })
+                            .collect()
+                    };
+                    let targets = call_targets.map(resolve);
+                    if targets.as_ref().is_some_and(HashSet::is_empty) {
+                        continue;
+                    }
+                    let methods: HashSet<u32> = if let Some(sources) = call_sources {
+                        resolve(sources)
+                    } else {
+                        targets
+                            .as_ref()
+                            .unwrap()
+                            .iter()
+                            .flat_map(|callee| file.callers_for_method(*callee))
+                            .collect()
+                    };
+                    if methods.is_empty() {
+                        continue;
+                    }
+                    let mut methods = methods.into_iter().collect::<Vec<_>>();
+                    methods.sort_unstable();
+                    let light = methods.len() <= LIGHT_CELLS_THRESHOLD;
+                    (FilePlan::CallMethods { methods, targets }, light)
+                } else if callee_classes.is_some() || callee_names.is_some() {
+                    let cc_ids = callee_classes.as_ref().map(|descriptors| {
+                        descriptors
+                            .iter()
+                            .filter_map(|descriptor| file.type_idx_for_descriptor(descriptor))
+                            .collect::<HashSet<_>>()
+                    });
+                    let cn_ids = callee_names.as_ref().map(|names| {
+                        names
+                            .iter()
+                            .filter_map(|name| file.find_string_idx(name))
+                            .collect::<HashSet<_>>()
+                    });
+                    if cc_ids.as_ref().is_some_and(HashSet::is_empty)
+                        || cn_ids.as_ref().is_some_and(HashSet::is_empty)
+                    {
+                        continue;
+                    }
+                    let mut targets = HashSet::new();
+                    let use_class = match (&cc_ids, &cn_ids) {
+                        (Some(c), Some(n)) => {
+                            let c_len: usize = c
+                                .iter()
+                                .filter_map(|id| file.methods_by_class.get(id))
+                                .map(Vec::len)
+                                .sum();
+                            let n_len: usize = n
+                                .iter()
+                                .filter_map(|id| file.methods_by_name.get(id))
+                                .map(Vec::len)
+                                .sum();
+                            c_len <= n_len
+                        }
+                        (Some(_), None) => true,
+                        (None, Some(_)) => false,
+                        (None, None) => unreachable!(),
+                    };
+                    if use_class {
+                        for id in cc_ids.as_ref().unwrap() {
+                            if let Some(entries) = file.methods_by_class.get(id) {
+                                for &mid in entries {
+                                    if cn_ids.as_ref().is_none_or(|nids| {
+                                        nids.contains(&file.methods[mid as usize].name_idx)
+                                    }) {
+                                        targets.insert(mid);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        for id in cn_ids.as_ref().unwrap() {
+                            if let Some(entries) = file.methods_by_name.get(id) {
+                                for &mid in entries {
+                                    if cc_ids.as_ref().is_none_or(|cids| {
+                                        cids.contains(
+                                            &(file.methods[mid as usize].class_idx as u32),
+                                        )
+                                    }) {
+                                        targets.insert(mid);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if targets.is_empty() {
+                        continue;
+                    }
+                    let methods: HashSet<u32> = targets
+                        .iter()
+                        .flat_map(|callee| file.callers_for_method(*callee))
+                        .collect();
+                    if methods.is_empty() {
+                        continue;
+                    }
+                    let mut methods = methods.into_iter().collect::<Vec<_>>();
+                    methods.sort_unstable();
+                    let light = methods.len() <= LIGHT_CELLS_THRESHOLD;
+                    (
+                        FilePlan::CallMethods {
+                            methods,
+                            targets: Some(targets),
+                        },
+                        light,
+                    )
+                } else {
+                    (FilePlan::Full, false)
+                }
+            }
+            "method_field_accesses" => {
+                if let Some(descriptors) = &member_descriptors {
+                    let mut methods = descriptors
+                        .iter()
+                        .filter_map(|descriptor| {
+                            let parts =
+                                crate::dex::metadata::parse_method_descriptor(descriptor).ok()?;
+                            file.method_reference_for_type(
+                                file.type_idx_for_descriptor(parts.class_descriptor)?,
+                                &parts,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    methods.sort_unstable();
+                    methods.dedup();
+                    let mut references = methods
+                        .into_iter()
+                        .flat_map(|method| file.using_field_refs(method))
+                        .collect::<Vec<_>>();
+                    if references.is_empty() {
+                        continue;
+                    }
+                    references.sort_by_key(|reference| {
+                        (*reference as *const crate::dex::MethodFieldRef) as usize
+                    });
+                    let light = references.len() <= LIGHT_CELLS_THRESHOLD;
+                    (FilePlan::FieldAccessRefs(references), light)
+                } else if let Some(descriptors) = &field_descriptors {
+                    let mut fields = descriptors
+                        .iter()
+                        .filter_map(|descriptor| {
+                            let parts =
+                                crate::dex::metadata::parse_field_descriptor(descriptor).ok()?;
+                            file.field_reference_for_type(
+                                file.type_idx_for_descriptor(parts.class_descriptor)?,
+                                &parts,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    fields.sort_unstable();
+                    fields.dedup();
+                    let mut references = fields
+                        .into_iter()
+                        .flat_map(|field| file.accesses_for_field(field))
+                        .collect::<Vec<_>>();
+                    if references.is_empty() {
+                        continue;
+                    }
+                    references.sort_by_key(|reference| {
+                        (*reference as *const crate::dex::MethodFieldRef) as usize
+                    });
+                    let light = references.len() <= LIGHT_CELLS_THRESHOLD;
+                    (FilePlan::FieldAccessRefs(references), light)
+                } else if field_access_classes.is_some()
+                    || field_access_names.is_some()
+                    || field_access_types.is_some()
+                {
+                    let fc_ids = field_access_classes.as_ref().map(|descriptors| {
+                        descriptors
+                            .iter()
+                            .filter_map(|descriptor| file.type_idx_for_descriptor(descriptor))
+                            .collect::<HashSet<_>>()
+                    });
+                    let fn_ids = field_access_names.as_ref().map(|names| {
+                        names
+                            .iter()
+                            .filter_map(|name| file.find_string_idx(name))
+                            .collect::<HashSet<_>>()
+                    });
+                    let ft_ids = field_access_types.as_ref().map(|descriptors| {
+                        descriptors
+                            .iter()
+                            .filter_map(|descriptor| file.type_idx_for_descriptor(descriptor))
+                            .collect::<HashSet<_>>()
+                    });
+                    if fc_ids.as_ref().is_some_and(HashSet::is_empty)
+                        || fn_ids.as_ref().is_some_and(HashSet::is_empty)
+                        || ft_ids.as_ref().is_some_and(HashSet::is_empty)
+                    {
+                        continue;
+                    }
+                    let mut fields = Vec::new();
+                    if let Some(cids) = &fc_ids {
+                        for &cid in cids {
+                            for field_idx in file.field_range_for_type(cid) {
+                                let field = &file.fields[field_idx as usize];
+                                if fn_ids
+                                    .as_ref()
+                                    .is_none_or(|nids| nids.contains(&field.name_idx))
+                                    && ft_ids
+                                        .as_ref()
+                                        .is_none_or(|tids| tids.contains(&(field.type_idx as u32)))
+                                {
+                                    fields.push(field_idx);
+                                }
+                            }
+                        }
+                    } else if let Some(nids) = &fn_ids {
+                        let index = file.field_name_index();
+                        for nid in nids {
+                            if let Some(entries) = index.get(nid) {
+                                for &field_idx in entries {
+                                    let field = &file.fields[field_idx as usize];
+                                    if ft_ids
+                                        .as_ref()
+                                        .is_none_or(|tids| tids.contains(&(field.type_idx as u32)))
+                                    {
+                                        fields.push(field_idx);
+                                    }
+                                }
+                            }
+                        }
+                    } else if let Some(tids) = &ft_ids {
+                        for (idx, field) in file.fields.iter().enumerate() {
+                            if tids.contains(&(field.type_idx as u32)) {
+                                fields.push(idx as u32);
+                            }
+                        }
+                    }
+                    if fields.is_empty() {
+                        continue;
+                    }
+                    fields.sort_unstable();
+                    fields.dedup();
+                    let mut references = fields
+                        .into_iter()
+                        .flat_map(|field| file.accesses_for_field(field))
+                        .collect::<Vec<_>>();
+                    if references.is_empty() {
+                        continue;
+                    }
+                    references.sort_by_key(|reference| {
+                        (*reference as *const crate::dex::MethodFieldRef) as usize
+                    });
+                    let light = references.len() <= LIGHT_CELLS_THRESHOLD;
+                    (FilePlan::FieldAccessRefs(references), light)
+                } else {
+                    (FilePlan::Full, false)
+                }
+            }
+            _ => (FilePlan::Full, false),
+        };
+
+        let mut cells = if use_light_cells {
+            Cells::light(file)
+        } else {
+            Cells::new(
+                file,
+                table,
+                needs_definitions && table == "methods",
+                columns,
+            )
+        };
         let mut consume = |source| {
             if !source_matches(filter, &mut cells, source, None) {
                 return Ok(false);
@@ -1891,53 +2489,40 @@ fn visit_source_records_filtered<'a>(
                     }
                 }
             }
-            "methods" | "method_ids" => {
-                let indices: Box<dyn Iterator<Item = u32>> =
-                    if let Some(methods) = method_candidates {
-                        Box::new(methods[file_index].iter().copied())
-                    } else {
-                        Box::new(0..file.methods.len() as u32)
-                    };
-                for index in indices {
-                    let method = &file.methods[index as usize];
-                    if class_ids
-                        .as_ref()
-                        .is_some_and(|ids| !ids.contains(&(method.class_idx as u32)))
-                        || return_ids.as_ref().is_some_and(|ids| {
-                            !ids.contains(&file.protos[method.proto_idx as usize].return_type_idx)
-                        })
-                    {
-                        continue;
-                    }
-                    if consume(Source::Method(index))? {
-                        return Ok(());
+            "methods" | "method_ids" => match plan {
+                FilePlan::Methods(indices) => {
+                    for index in indices {
+                        if consume(Source::Method(index))? {
+                            return Ok(());
+                        }
                     }
                 }
-            }
-            "classes" => {
-                for class in &file.classes {
-                    if class_ids
-                        .as_ref()
-                        .is_some_and(|ids| !ids.contains(&class.class_idx))
-                    {
-                        continue;
-                    }
-                    if consume(Source::Class(class))? {
-                        return Ok(());
+                _ => {
+                    for index in 0..file.methods.len() as u32 {
+                        if consume(Source::Method(index))? {
+                            return Ok(());
+                        }
                     }
                 }
-            }
+            },
+            "classes" => match plan {
+                FilePlan::ClassOrdinals(ordinals) => {
+                    for ordinal in ordinals {
+                        if consume(Source::Class(&file.classes[ordinal as usize]))? {
+                            return Ok(());
+                        }
+                    }
+                }
+                _ => {
+                    for class in &file.classes {
+                        if consume(Source::Class(class))? {
+                            return Ok(());
+                        }
+                    }
+                }
+            },
             "class_methods" | "class_fields" | "class_interfaces" => {
-                for class in &file.classes {
-                    if class_ids
-                        .as_ref()
-                        .is_some_and(|ids| !ids.contains(&class.class_idx))
-                        || member_classes
-                            .as_ref()
-                            .is_some_and(|ids| !ids.contains(&class.class_idx))
-                    {
-                        continue;
-                    }
+                let mut visit_class = |class: &'a crate::dex::ClassInfo| -> Result<bool, String> {
                     let count = match table {
                         "class_methods" => class.methods.len(),
                         "class_fields" => class.fields.len(),
@@ -1955,6 +2540,22 @@ fn visit_source_records_filtered<'a>(
                             {
                                 continue;
                             }
+                        } else if table == "class_interfaces" {
+                            let iface = class.interfaces[position] as u32;
+                            if interface_ids
+                                .as_ref()
+                                .is_some_and(|ids| !ids.contains(&iface))
+                            {
+                                continue;
+                            }
+                        } else if table == "class_methods" {
+                            let method = &file.methods[class.methods[position].method_idx as usize];
+                            if class_method_name_ids
+                                .as_ref()
+                                .is_some_and(|ids| !ids.contains(&method.name_idx))
+                            {
+                                continue;
+                            }
                         }
                         let source = match table {
                             "class_methods" => Source::ClassMethod(class, position),
@@ -1962,31 +2563,44 @@ fn visit_source_records_filtered<'a>(
                             _ => Source::ClassInterface(class, position),
                         };
                         if consume(source)? {
-                            return Ok(());
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                };
+                match plan {
+                    FilePlan::ClassOrdinals(ordinals) => {
+                        for ordinal in ordinals {
+                            if visit_class(&file.classes[ordinal as usize])? {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    _ => {
+                        for class in &file.classes {
+                            if visit_class(class)? {
+                                return Ok(());
+                            }
                         }
                     }
                 }
             }
-            "fields" | "field_ids" => {
-                for index in 0..file.fields.len() as u32 {
-                    let field = &file.fields[index as usize];
-                    if class_ids
-                        .as_ref()
-                        .is_some_and(|ids| !ids.contains(&(field.class_idx as u32)))
-                        || field_type_ids
-                            .as_ref()
-                            .is_some_and(|ids| !ids.contains(&(field.type_idx as u32)))
-                        || field_name_ids
-                            .as_ref()
-                            .is_some_and(|ids| !ids.contains(&field.name_idx))
-                    {
-                        continue;
-                    }
-                    if consume(Source::Field(index))? {
-                        return Ok(());
+            "fields" | "field_ids" => match plan {
+                FilePlan::Fields(indices) => {
+                    for index in indices {
+                        if consume(Source::Field(index))? {
+                            return Ok(());
+                        }
                     }
                 }
-            }
+                _ => {
+                    for index in 0..file.fields.len() as u32 {
+                        if consume(Source::Field(index))? {
+                            return Ok(());
+                        }
+                    }
+                }
+            },
             "method_strings" => {
                 for reference in &file.method_strings {
                     if consume(Source::String(reference))? {
@@ -1994,33 +2608,8 @@ fn visit_source_records_filtered<'a>(
                     }
                 }
             }
-            "method_calls" => {
-                if call_targets.is_some() || call_sources.is_some() {
-                    let resolve = |descriptors: &[String]| -> HashSet<u32> {
-                        descriptors
-                            .iter()
-                            .filter_map(|descriptor| {
-                                let parts =
-                                    crate::dex::metadata::parse_method_descriptor(descriptor)
-                                        .ok()?;
-                                let class = file.type_idx_for_descriptor(parts.class_descriptor)?;
-                                file.method_reference_for_type(class, &parts)
-                            })
-                            .collect()
-                    };
-                    let targets = call_targets.map(resolve);
-                    let methods = if let Some(sources) = call_sources {
-                        resolve(sources)
-                    } else {
-                        targets
-                            .as_ref()
-                            .unwrap()
-                            .iter()
-                            .flat_map(|callee| file.callers_for_method(*callee))
-                            .collect()
-                    };
-                    let mut methods = methods.into_iter().collect::<Vec<_>>();
-                    methods.sort_unstable();
+            "method_calls" => match plan {
+                FilePlan::CallMethods { methods, targets } => {
                     for method in methods {
                         for reference in file.invokes_for_method(method) {
                             if targets.as_ref().is_none_or(|targets| {
@@ -2031,70 +2620,31 @@ fn visit_source_records_filtered<'a>(
                             }
                         }
                     }
-                } else {
+                }
+                _ => {
                     for reference in &file.method_calls {
                         if consume(Source::Call(reference))? {
                             return Ok(());
                         }
                     }
                 }
-            }
-            "method_field_accesses" => {
-                let references: Box<dyn Iterator<Item = _>> = if let Some(descriptors) =
-                    &member_descriptors
-                {
-                    let mut methods = descriptors
-                        .iter()
-                        .filter_map(|descriptor| {
-                            let parts =
-                                crate::dex::metadata::parse_method_descriptor(descriptor).ok()?;
-                            file.method_reference_for_type(
-                                file.type_idx_for_descriptor(parts.class_descriptor)?,
-                                &parts,
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    methods.sort_unstable();
-                    methods.dedup();
-                    let mut references = methods
-                        .into_iter()
-                        .flat_map(|method| file.using_field_refs(method))
-                        .collect::<Vec<_>>();
-                    references.sort_by_key(|reference| {
-                        (*reference as *const crate::dex::MethodFieldRef) as usize
-                    });
-                    Box::new(references.into_iter())
-                } else if let Some(descriptors) = &field_descriptors {
-                    let mut fields = descriptors
-                        .iter()
-                        .filter_map(|descriptor| {
-                            let parts =
-                                crate::dex::metadata::parse_field_descriptor(descriptor).ok()?;
-                            file.field_reference_for_type(
-                                file.type_idx_for_descriptor(parts.class_descriptor)?,
-                                &parts,
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    fields.sort_unstable();
-                    fields.dedup();
-                    let mut references = fields
-                        .into_iter()
-                        .flat_map(|field| file.accesses_for_field(field))
-                        .collect::<Vec<_>>();
-                    references.sort_by_key(|reference| {
-                        (*reference as *const crate::dex::MethodFieldRef) as usize
-                    });
-                    Box::new(references.into_iter())
-                } else {
-                    Box::new(file.method_field_accesses.iter())
-                };
-                for reference in references {
-                    if consume(Source::FieldAccess(reference))? {
-                        return Ok(());
+            },
+            "method_field_accesses" => match plan {
+                FilePlan::FieldAccessRefs(references) => {
+                    for reference in references {
+                        if consume(Source::FieldAccess(reference))? {
+                            return Ok(());
+                        }
                     }
                 }
-            }
+                _ => {
+                    for reference in &file.method_field_accesses {
+                        if consume(Source::FieldAccess(reference))? {
+                            return Ok(());
+                        }
+                    }
+                }
+            },
             "method_used_types" => {
                 for reference in &file.method_used_types {
                     if consume(Source::Type(reference))? {
