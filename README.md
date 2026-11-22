@@ -99,4 +99,4 @@ cargo test --workspace
 
 ## license
 
-of course i have no permission to declare a license. the docs are fetched from original, which are MIT.
+code is Apache-2.0. the docs are fetched from original (probably slightly modified by my agent idk) which are MIT.
