@@ -24,7 +24,7 @@ a rust reimplementation of parts of [lsposed/dexsql-release](https://github.com/
 
 you should not assume this implementation is faster than the original dexsql. in fact, it even isn't on par with original, it is a lot worse than that.
 
-also there is no proper benchmark suite, the only thing i can tell you is that, after replacing dexkit with this dexsql in wekit, total dex resolution time decreases from ~30s to ~11s. yes i know this sounds promising, but please. don't attempt to use this for serious work.
+also there is no proper benchmark suite, the only thing i can tell you is that, after replacing dexkit with this dexsql in wekit, total dex resolution time decreases from ~30s to ~5s. yes i know this sounds promising, but please. don't attempt to use this for serious work.
 
 ### memory usage
 
